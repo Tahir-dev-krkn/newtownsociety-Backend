@@ -140,7 +140,7 @@ app.post("/login", async(req,res)=>{
   res.json({success:true,token,role:user.role});
 });
 
- auth, adminOnly, async(req,res)=>{
+app.get("/fix-owner-password", auth, adminOnly, async(req,res)=>{
 
   const owner = await Member.findOne({ role: "owner" });
 
@@ -153,7 +153,7 @@ app.post("/login", async(req,res)=>{
   await owner.save();
 
   res.send("Owner password fixed");
-};
+});
 
 app.post("/send-reminder", auth, adminOnly, async (req, res) => {
   const { memberId } = req.body;
