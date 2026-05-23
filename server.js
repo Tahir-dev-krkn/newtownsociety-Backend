@@ -1209,7 +1209,7 @@ app.get("/complaints", auth, adminOnly, async(req,res)=>{
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    build: "vercel-mail-relay",
+    build: "vercel-mail-relay-jwt-secret",
     emailUser: maskEmail(process.env.EMAIL_USER),
     emailPassConfigured: Boolean(process.env.EMAIL_PASS),
     mailRelay: shouldUseMailRelay() ? getMailRelayUrl() : null,
