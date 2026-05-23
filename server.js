@@ -359,60 +359,83 @@ app.put("/update-profile", auth, async (req, res) => {
 });
 
 app.post("/send-otp", async (req, res) => {
-  const { email } = req.body;
+  try {
+    const { email } = req.body;
+    const cleanEmail = normalizeEmail(email);
 
-  const user = await Member.findOne({
-    email: normalizeEmail(email)
-  });
+    if (!cleanEmail) return res.status(400).send("Enter email");
 
-  if (!user) return res.send("User not found");
+    const user = await Member.findOne({
+      email: cleanEmail
+    });
 
-  const otp = Math.floor(100000 + Math.random() * 900000);
+    if (!user) return res.status(404).send("No account found with this email");
 
-  user.otp = otp;
-  user.otpExpiry = Date.now() + 5 * 60 * 1000;
+    const otp = Math.floor(100000 + Math.random() * 900000);
 
-  await user.save(); // 🔥 THIS IS THE REAL FIX
+    user.otp = otp;
+    user.otpExpiry = Date.now() + 5 * 60 * 1000;
 
-  console.log("✅ OTP SAVED:", user.otp);
+    await user.save();
 
-  await transporter.sendMail({
-    to: email,
-    subject: "OTP Verification",
-    text: `Your OTP is ${otp}`
-  });
+    console.log("Password reset OTP saved for:", cleanEmail);
 
-  res.send("OTP sent");
+    try {
+      await transporter.sendMail({
+        to: cleanEmail,
+        subject: "OTP Verification",
+        text: `Your New Town Society password reset OTP is ${otp}. This OTP expires in 5 minutes.`
+      });
+    } catch (emailError) {
+      console.log("Password reset OTP email failed:", emailError.message);
+      return res.status(500).send("OTP email could not be sent. Check EMAIL_USER and EMAIL_PASS in Render.");
+    }
+
+    res.send("OTP sent");
+  } catch (error) {
+    console.log("Send OTP error:", error);
+    res.status(500).send("Could not send OTP");
+  }
 });
 
 app.post("/verify-otp", async (req, res) => {
-  const { email, otp, newPassword } = req.body;
+  try {
+    const { email, otp, newPassword } = req.body;
+    const cleanEmail = normalizeEmail(email);
 
-  const user = await Member.findOne({
-    email: normalizeEmail(email)
-  });
+    if (!cleanEmail || !otp || !newPassword) {
+      return res.status(400).send("Enter email, OTP, and new password");
+    }
 
-  if (!user) return res.send("User not found");
+    const user = await Member.findOne({
+      email: cleanEmail
+    });
 
-  console.log("ENTERED OTP:", otp);
-  console.log("DB OTP:", user.otp);
+    if (!user) return res.status(404).send("No account found with this email");
 
-  // 🔥 FORCE STRING MATCH (MOST IMPORTANT)
-  if (String(user.otp) !== String(otp)) {
-    return res.send("Wrong OTP");
+    if (!user.otp || !user.otpExpiry) {
+      return res.status(400).send("Please request a new OTP");
+    }
+
+    if (String(user.otp) !== String(otp)) {
+      return res.status(400).send("Wrong OTP");
+    }
+
+    if (Date.now() > user.otpExpiry) {
+      return res.status(400).send("OTP expired");
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.otp = null;
+    user.otpExpiry = null;
+
+    await user.save();
+
+    res.send("Password updated");
+  } catch (error) {
+    console.log("Verify OTP error:", error);
+    res.status(500).send("Could not reset password");
   }
-
-  if (Date.now() > user.otpExpiry) {
-    return res.send("OTP expired");
-  }
-
-  user.password = await bcrypt.hash(newPassword, 10);
-  user.otp = null;
-  user.otpExpiry = null;
-
-  await user.save();
-
-  res.send("Password updated");
 });
 
 // ================= ADD DUE =================
