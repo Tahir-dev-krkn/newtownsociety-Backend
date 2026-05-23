@@ -138,6 +138,10 @@ function maskEmail(email){
   return `${name.slice(0,2)}***@${domain}`;
 }
 
+function escapeRegex(value){
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function sendEmailVerificationOtp(user){
   if(!user.email){
     throw new Error("No email registered");
@@ -444,15 +448,44 @@ app.post("/add-member", auth,adminOnly, async (req, res) => {
   try {
     const { name, flatNumber, phone, email, area } = req.body;
 
-const hashedPassword = await bcrypt.hash(flatNumber, 10);
+    const cleanName = String(name || "").trim();
+    const cleanFlatNumber = String(flatNumber || "").trim();
+    const cleanPhone = String(phone || "").trim();
+    const cleanEmail = normalizeEmail(email);
+    const cleanArea = Number(area);
+
+    if(!cleanName || !cleanFlatNumber || !cleanPhone || !cleanEmail || !cleanArea){
+      return res.status(400).send("Please fill all member details");
+    }
+
+    if(!/^\S+@\S+\.\S+$/.test(cleanEmail)){
+      return res.status(400).send("Please enter a valid email address");
+    }
+
+    const existingMember = await Member.findOne({
+      $or: [
+        { flatNumber: { $regex: `^${escapeRegex(cleanFlatNumber)}$`, $options: "i" } },
+        { email: cleanEmail }
+      ]
+    });
+
+    if(existingMember){
+      if(existingMember.flatNumber?.toLowerCase() === cleanFlatNumber.toLowerCase()){
+        return res.status(409).send("This flat number already exists");
+      }
+
+      return res.status(409).send("This email is already used by another member");
+    }
+
+const hashedPassword = await bcrypt.hash(cleanFlatNumber, 10);
 
 const newMember = new Member({
-  name,
-  flatNumber,
-  area: Number(area),
-  monthlyMaintenance: Number(area) * 1.5,
-  phone,
-  email: normalizeEmail(email),
+  name: cleanName,
+  flatNumber: cleanFlatNumber,
+  area: cleanArea,
+  monthlyMaintenance: cleanArea * 1.5,
+  phone: cleanPhone,
+  email: cleanEmail,
   emailVerified: false,
   password: hashedPassword,
   role: "owner",
@@ -461,16 +494,14 @@ const newMember = new Member({
 
     await newMember.save();
 
-    try{
-      await sendEmailVerificationOtp(newMember);
-      res.send("Member added successfully. Verification OTP sent to owner email.");
-    }catch(mailErr){
-      console.log("Verification email failed:", mailErr.message);
-      res.send("Member added successfully, but verification email could not be sent.");
-    }
+    sendEmailVerificationOtp(newMember)
+      .then(() => console.log(`Verification OTP sent to ${newMember.email}`))
+      .catch(mailErr => console.log("Verification email failed:", mailErr.message));
+
+    res.status(201).send("Member added successfully. Verification OTP is being sent to owner email.");
   } catch (err) {
-    console.log(err);
-    res.status(500).send("Error adding member");
+    console.log("Add member error:", err);
+    res.status(500).send(err.message || "Error adding member");
   }
 });
 
