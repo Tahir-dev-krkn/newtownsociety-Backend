@@ -1142,6 +1142,25 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/health-email", async (req, res) => {
+  try {
+    await transporter.verify();
+    res.json({
+      ok: true,
+      emailUser: maskEmail(process.env.EMAIL_USER)
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      emailUser: maskEmail(process.env.EMAIL_USER),
+      code: error.code,
+      responseCode: error.responseCode,
+      command: error.command,
+      message: error.message
+    });
+  }
+});
+
 // ================= SERVER =================
 const PORT = process.env.PORT || 5000;
 
