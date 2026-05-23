@@ -168,7 +168,7 @@ function getMailRelayUrl(){
 }
 
 function getMailRelaySecret(){
-  return process.env.MAIL_RELAY_SECRET || process.env.JWT_SECRET;
+  return process.env.JWT_SECRET;
 }
 
 async function relayMail(mailOptions){
