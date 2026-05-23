@@ -680,8 +680,13 @@ app.post("/verify-payment", async (req, res) => {
     }
 
     // ✅ VERIFY SIGNATURE
+    if (!process.env.RAZORPAY_KEY_SECRET) {
+      console.log("❌ Missing RAZORPAY_KEY_SECRET");
+      return res.status(500).json({ error: "Payment secret is not configured" });
+    }
+
     const generated_signature = crypto
-      .createHmac("sha256", "wvfGrK3mtyScjWZB3KZN65q1")
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(razorpay_order_id + "|" + razorpay_payment_id)
       .digest("hex");
 
