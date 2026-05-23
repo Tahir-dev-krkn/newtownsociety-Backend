@@ -6,6 +6,12 @@ const MemberSchema = new mongoose.Schema({
   area: Number,
   phone: String,
   email: String,
+  emailVerified: {
+    type: Boolean,
+    default: false
+  },
+  emailVerificationOtp: Number,
+  emailVerificationExpiry: Number,
   password: String,
   role: String,
   monthlyMaintenance: Number,
@@ -29,17 +35,5 @@ const MemberSchema = new mongoose.Schema({
     }
   ]
 });
-
-complaints: [
-  {
-    message: String,
-    date: {
-      type: Date,
-      default: Date.now
-    }
-  }
-],
-
-
 
 module.exports = mongoose.model("Member", MemberSchema);

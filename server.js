@@ -125,6 +125,44 @@ function monthToNumber(month){
   return new Date(Date.parse(month +" 1, 2020")).getMonth() + 1;
 }
 
+function normalizeEmail(email){
+  return String(email || "").trim().toLowerCase();
+}
+
+function maskEmail(email){
+  const cleanEmail = normalizeEmail(email);
+  const [name, domain] = cleanEmail.split("@");
+
+  if(!name || !domain) return "";
+
+  return `${name.slice(0,2)}***@${domain}`;
+}
+
+async function sendEmailVerificationOtp(user){
+  if(!user.email){
+    throw new Error("No email registered");
+  }
+
+  const otp = Math.floor(100000 + Math.random() * 900000);
+
+  user.emailVerificationOtp = otp;
+  user.emailVerificationExpiry = Date.now() + 10 * 60 * 1000;
+
+  await user.save();
+
+  await transporter.sendMail({
+    to: user.email,
+    subject: "Verify your New Town Society account",
+    text: `Hello ${user.name || "Resident"},
+
+Your New Town Society email verification OTP is ${otp}.
+
+This OTP will expire in 10 minutes.
+
+If you did not try to login, please contact the society office.`
+  });
+}
+
 
 
 // ================= LOGIN =================
@@ -136,8 +174,66 @@ app.post("/login", async(req,res)=>{
   const match=await bcrypt.compare(req.body.password,user.password);
   if(!match) return res.json({success:false});
 
+  if(user.role === "owner" && user.emailVerified !== true){
+    if(!user.email){
+      return res.json({
+        success:false,
+        verificationRequired:true,
+        message:"Email verification required. No email is registered for this flat. Contact admin."
+      });
+    }
+
+    try{
+      await sendEmailVerificationOtp(user);
+    }catch(err){
+      console.log("Email verification OTP error:", err.message);
+      return res.status(500).json({
+        success:false,
+        verificationRequired:true,
+        message:"Could not send verification OTP. Try again later."
+      });
+    }
+
+    return res.json({
+      success:false,
+      verificationRequired:true,
+      email: maskEmail(user.email),
+      message:"Email verification required. OTP sent to registered email."
+    });
+  }
+
   const token=jwt.sign({flat:user.flatNumber,role:user.role},SECRET);
   res.json({success:true,token,role:user.role});
+});
+
+app.post("/verify-email", async(req,res)=>{
+  const { flatNumber, otp } = req.body;
+
+  const user = await Member.findOne({ flatNumber });
+
+  if(!user) return res.status(404).json({ success:false, message:"User not found" });
+  if(user.role !== "owner") return res.status(400).json({ success:false, message:"Only owners need email verification" });
+  if(user.emailVerified === true) return res.json({ success:true, message:"Email already verified" });
+
+  if(!user.emailVerificationOtp || !user.emailVerificationExpiry){
+    return res.status(400).json({ success:false, message:"Verification OTP not found. Please login again to resend OTP." });
+  }
+
+  if(String(user.emailVerificationOtp) !== String(otp)){
+    return res.status(400).json({ success:false, message:"Wrong OTP" });
+  }
+
+  if(Date.now() > user.emailVerificationExpiry){
+    return res.status(400).json({ success:false, message:"OTP expired. Please login again to resend OTP." });
+  }
+
+  user.emailVerified = true;
+  user.emailVerificationOtp = null;
+  user.emailVerificationExpiry = null;
+
+  await user.save();
+
+  res.json({ success:true, message:"Email verified successfully" });
 });
 
 app.get("/fix-owner-password", auth, adminOnly, async(req,res)=>{
@@ -215,13 +311,21 @@ app.get("/members", auth, async (req, res) => {
 });
 
 app.put("/member/:id", auth, adminOnly, async (req, res) => {
+  const existingMember = await Member.findById(req.params.id);
+  if(!existingMember) return res.status(404).send("Member not found");
 
   const updateData = {
   name: req.body.name,
   phone: req.body.phone,
-  email: req.body.email,
+  email: normalizeEmail(req.body.email),
   flatNumber: req.body.flatNumber   // ✅ ADD THIS LINE
 };
+
+  if(normalizeEmail(existingMember.email) !== normalizeEmail(req.body.email)){
+    updateData.emailVerified = false;
+    updateData.emailVerificationOtp = null;
+    updateData.emailVerificationExpiry = null;
+  }
 
   // 🔥 ONLY FOR MEMBERS (who have area)
   if (req.body.area && !isNaN(req.body.area)) {
@@ -254,7 +358,7 @@ app.post("/send-otp", async (req, res) => {
   const { email } = req.body;
 
   const user = await Member.findOne({
-    email: email.trim().toLowerCase()
+    email: normalizeEmail(email)
   });
 
   if (!user) return res.send("User not found");
@@ -281,7 +385,7 @@ app.post("/verify-otp", async (req, res) => {
   const { email, otp, newPassword } = req.body;
 
   const user = await Member.findOne({
-    email: email.trim().toLowerCase()
+    email: normalizeEmail(email)
   });
 
   if (!user) return res.send("User not found");
@@ -348,7 +452,8 @@ const newMember = new Member({
   area: Number(area),
   monthlyMaintenance: Number(area) * 1.5,
   phone,
-  email,
+  email: normalizeEmail(email),
+  emailVerified: false,
   password: hashedPassword,
   role: "owner",
   payments: []
@@ -356,7 +461,13 @@ const newMember = new Member({
 
     await newMember.save();
 
-    res.send("Member added successfully");
+    try{
+      await sendEmailVerificationOtp(newMember);
+      res.send("Member added successfully. Verification OTP sent to owner email.");
+    }catch(mailErr){
+      console.log("Verification email failed:", mailErr.message);
+      res.send("Member added successfully, but verification email could not be sent.");
+    }
   } catch (err) {
     console.log(err);
     res.status(500).send("Error adding member");
