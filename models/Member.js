@@ -20,6 +20,8 @@ const MemberSchema = new mongoose.Schema({
   // 🔥 OTP FIELDS
   otp: Number,
   otpExpiry: Number,
+  passwordResetTokenHash: String,
+  passwordResetExpiry: Number,
 
   // 🔥 PAYMENTS (INSIDE SCHEMA)
   payments: [

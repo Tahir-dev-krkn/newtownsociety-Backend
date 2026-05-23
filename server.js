@@ -6,6 +6,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const ExcelJS = require("exceljs");
 const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 const Member = require("./models/Member");
 const cron = require("node-cron");
 const Razorpay = require("razorpay");
@@ -31,6 +32,9 @@ const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
   secure: true,
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
@@ -142,6 +146,16 @@ function escapeRegex(value){
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function hashToken(token){
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function sendMailInBackground(mailOptions, context){
+  transporter.sendMail(mailOptions)
+    .then(() => console.log(`${context} email sent`))
+    .catch(error => console.log(`${context} email failed:`, error.message));
+}
+
 async function sendEmailVerificationOtp(user){
   if(!user.email){
     throw new Error("No email registered");
@@ -154,7 +168,7 @@ async function sendEmailVerificationOtp(user){
 
   await user.save();
 
-  await transporter.sendMail({
+  sendMailInBackground({
     to: user.email,
     subject: "Verify your New Town Society account",
     text: `Hello ${user.name || "Resident"},
@@ -164,7 +178,7 @@ Your New Town Society email verification OTP is ${otp}.
 This OTP will expire in 10 minutes.
 
 If you did not try to login, please contact the society office.`
-  });
+  }, `Verification OTP for ${user.email}`);
 }
 
 
@@ -358,7 +372,7 @@ app.put("/update-profile", auth, async (req, res) => {
   res.send("Profile updated");
 });
 
-app.post("/send-otp", async (req, res) => {
+async function sendPasswordResetLink(req, res){
   try {
     const { email } = req.body;
     const cleanEmail = normalizeEmail(email);
@@ -371,30 +385,78 @@ app.post("/send-otp", async (req, res) => {
 
     if (!user) return res.status(404).send("No account found with this email");
 
-    const otp = Math.floor(100000 + Math.random() * 900000);
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const appOrigin =
+      req.get("origin") ||
+      process.env.FRONTEND_URL ||
+      "https://newtownsociety-frontend.vercel.app";
+    const resetLink = `${appOrigin}/?resetToken=${encodeURIComponent(resetToken)}&email=${encodeURIComponent(cleanEmail)}`;
 
-    user.otp = otp;
-    user.otpExpiry = Date.now() + 5 * 60 * 1000;
+    user.passwordResetTokenHash = hashToken(resetToken);
+    user.passwordResetExpiry = Date.now() + 15 * 60 * 1000;
 
     await user.save();
 
-    console.log("Password reset OTP saved for:", cleanEmail);
+    console.log("Password reset link saved for:", cleanEmail);
 
-    try {
-      await transporter.sendMail({
-        to: cleanEmail,
-        subject: "OTP Verification",
-        text: `Your New Town Society password reset OTP is ${otp}. This OTP expires in 5 minutes.`
-      });
-    } catch (emailError) {
-      console.log("Password reset OTP email failed:", emailError.message);
-      return res.status(500).send("OTP email could not be sent. Check EMAIL_USER and EMAIL_PASS in Render.");
+    sendMailInBackground({
+      to: cleanEmail,
+      subject: "Reset your New Town Society password",
+      text: `Hello ${user.name || "Resident"},
+
+Open this secure link to reset your New Town Society password:
+${resetLink}
+
+This link expires in 15 minutes. If you did not request this, please ignore this email.`
+    }, `Password reset link for ${cleanEmail}`);
+
+    res.send("Password reset link sent");
+  } catch (error) {
+    console.log("Send reset link error:", error);
+    res.status(500).send("Could not send reset link");
+  }
+}
+
+app.post("/send-reset-link", sendPasswordResetLink);
+
+app.post("/send-otp", sendPasswordResetLink);
+
+app.post("/reset-password", async (req, res) => {
+  try {
+    const { email, token, newPassword } = req.body;
+    const cleanEmail = normalizeEmail(email);
+
+    if (!cleanEmail || !token || !newPassword) {
+      return res.status(400).send("Open the reset link and enter a new password");
     }
 
-    res.send("OTP sent");
+    if (String(newPassword).length < 4) {
+      return res.status(400).send("Password must be at least 4 characters");
+    }
+
+    const user = await Member.findOne({
+      email: cleanEmail,
+      passwordResetTokenHash: hashToken(token)
+    });
+
+    if (!user) return res.status(400).send("Reset link is invalid");
+
+    if (!user.passwordResetExpiry || Date.now() > user.passwordResetExpiry) {
+      return res.status(400).send("Reset link expired. Please request a new link");
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.passwordResetTokenHash = null;
+    user.passwordResetExpiry = null;
+    user.otp = null;
+    user.otpExpiry = null;
+
+    await user.save();
+
+    res.send("Password updated");
   } catch (error) {
-    console.log("Send OTP error:", error);
-    res.status(500).send("Could not send OTP");
+    console.log("Reset password error:", error);
+    res.status(500).send("Could not reset password");
   }
 });
 
@@ -824,8 +886,6 @@ app.post("/create-order", async (req, res) => {
     res.status(500).json({ error: "Order creation failed" });
   }
 });
-
-const crypto = require("crypto");
 
 app.post("/verify-payment", async (req, res) => {
   try {
