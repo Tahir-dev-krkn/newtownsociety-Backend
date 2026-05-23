@@ -1132,6 +1132,16 @@ app.get("/complaints", auth, adminOnly, async(req,res)=>{
   }
 });
 
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    build: "f506087-env-override",
+    emailUser: maskEmail(process.env.EMAIL_USER),
+    emailPassConfigured: Boolean(process.env.EMAIL_PASS),
+    razorpayConfigured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
+  });
+});
+
 // ================= SERVER =================
 const PORT = process.env.PORT || 5000;
 
