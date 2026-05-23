@@ -159,17 +159,80 @@ async function createMailTransporter(){
   });
 }
 
+function shouldUseMailRelay(){
+  return Boolean(process.env.RENDER || process.env.MAIL_RELAY_URL);
+}
+
+function getMailRelayUrl(){
+  return process.env.MAIL_RELAY_URL || "https://newtownsociety-frontend.vercel.app/api/send-email";
+}
+
+function getMailRelaySecret(){
+  return process.env.MAIL_RELAY_SECRET || process.env.JWT_SECRET;
+}
+
+async function relayMail(mailOptions){
+  const relaySecret = getMailRelaySecret();
+
+  if(!relaySecret){
+    throw new Error("Mail relay secret is not configured");
+  }
+
+  const response = await fetch(getMailRelayUrl(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-mail-relay-secret": relaySecret
+    },
+    body: JSON.stringify({
+      to: mailOptions.to,
+      subject: mailOptions.subject,
+      text: mailOptions.text
+    })
+  });
+
+  if(!response.ok){
+    const message = await response.text();
+    throw new Error(message || "Mail relay failed");
+  }
+}
+
+async function verifyMailRelay(){
+  const relaySecret = getMailRelaySecret();
+
+  if(!relaySecret){
+    throw new Error("Mail relay secret is not configured");
+  }
+
+  const response = await fetch(getMailRelayUrl(), {
+    headers: {
+      "x-mail-relay-secret": relaySecret
+    }
+  });
+
+  if(!response.ok){
+    const message = await response.text();
+    throw new Error(message || "Mail relay health check failed");
+  }
+}
+
 function sendMailInBackground(mailOptions, context){
-  createMailTransporter()
-    .then(transporter => transporter.sendMail(mailOptions))
+  (shouldUseMailRelay()
+    ? relayMail(mailOptions)
+    : createMailTransporter().then(transporter => transporter.sendMail(mailOptions)))
     .then(() => console.log(`${context} email sent`))
     .catch(error => console.log(`${context} email failed:`, error.message));
 }
 
 async function sendMailNow(mailOptions, context){
   try {
-    const transporter = await createMailTransporter();
-    await transporter.sendMail(mailOptions);
+    if(shouldUseMailRelay()){
+      await relayMail(mailOptions);
+    }else{
+      const transporter = await createMailTransporter();
+      await transporter.sendMail(mailOptions);
+    }
+
     console.log(`${context} email sent`);
   } catch (error) {
     console.log(`${context} email failed:`, error.message);
@@ -1146,25 +1209,33 @@ app.get("/complaints", auth, adminOnly, async(req,res)=>{
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    build: "smtp-ipv4-transport",
+    build: "vercel-mail-relay",
     emailUser: maskEmail(process.env.EMAIL_USER),
     emailPassConfigured: Boolean(process.env.EMAIL_PASS),
+    mailRelay: shouldUseMailRelay() ? getMailRelayUrl() : null,
     razorpayConfigured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
   });
 });
 
 app.get("/health-email", async (req, res) => {
   try {
-    const transporter = await createMailTransporter();
-    await transporter.verify();
+    if(shouldUseMailRelay()){
+      await verifyMailRelay();
+    }else{
+      const transporter = await createMailTransporter();
+      await transporter.verify();
+    }
+
     res.json({
       ok: true,
-      emailUser: maskEmail(process.env.EMAIL_USER)
+      emailUser: maskEmail(process.env.EMAIL_USER),
+      via: shouldUseMailRelay() ? "relay" : "smtp"
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
       emailUser: maskEmail(process.env.EMAIL_USER),
+      via: shouldUseMailRelay() ? "relay" : "smtp",
       code: error.code,
       responseCode: error.responseCode,
       command: error.command,
