@@ -7,6 +7,7 @@ const jwt = require("jsonwebtoken");
 const ExcelJS = require("exceljs");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
+const dns = require("dns").promises;
 const Member = require("./models/Member");
 const cron = require("node-cron");
 const Razorpay = require("razorpay");
@@ -26,20 +27,6 @@ const client = twilio(
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET
-});
-
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  family: 4,
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 10000,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
 });
 
 const app = express();
@@ -151,14 +138,36 @@ function hashToken(token){
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+async function createMailTransporter(){
+  const [smtpHost] = await dns.resolve4("smtp.gmail.com");
+
+  return nodemailer.createTransport({
+    host: smtpHost || "smtp.gmail.com",
+    port: 465,
+    secure: true,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 10000,
+    tls: {
+      servername: "smtp.gmail.com"
+    },
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS
+    }
+  });
+}
+
 function sendMailInBackground(mailOptions, context){
-  transporter.sendMail(mailOptions)
+  createMailTransporter()
+    .then(transporter => transporter.sendMail(mailOptions))
     .then(() => console.log(`${context} email sent`))
     .catch(error => console.log(`${context} email failed:`, error.message));
 }
 
 async function sendMailNow(mailOptions, context){
   try {
+    const transporter = await createMailTransporter();
     await transporter.sendMail(mailOptions);
     console.log(`${context} email sent`);
   } catch (error) {
@@ -1136,7 +1145,7 @@ app.get("/complaints", auth, adminOnly, async(req,res)=>{
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    build: "f506087-env-override",
+    build: "smtp-ipv4-transport",
     emailUser: maskEmail(process.env.EMAIL_USER),
     emailPassConfigured: Boolean(process.env.EMAIL_PASS),
     razorpayConfigured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
@@ -1145,6 +1154,7 @@ app.get("/health", (req, res) => {
 
 app.get("/health-email", async (req, res) => {
   try {
+    const transporter = await createMailTransporter();
     await transporter.verify();
     res.json({
       ok: true,
