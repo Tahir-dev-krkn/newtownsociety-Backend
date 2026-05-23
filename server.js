@@ -156,7 +156,17 @@ function sendMailInBackground(mailOptions, context){
     .catch(error => console.log(`${context} email failed:`, error.message));
 }
 
-async function sendEmailVerificationOtp(user){
+async function sendMailNow(mailOptions, context){
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`${context} email sent`);
+  } catch (error) {
+    console.log(`${context} email failed:`, error.message);
+    throw new Error("Email could not be sent. Check EMAIL_USER and EMAIL_PASS in Render.");
+  }
+}
+
+async function sendEmailVerificationOtp(user, options = {}){
   if(!user.email){
     throw new Error("No email registered");
   }
@@ -168,7 +178,7 @@ async function sendEmailVerificationOtp(user){
 
   await user.save();
 
-  sendMailInBackground({
+  const mailOptions = {
     to: user.email,
     subject: "Verify your New Town Society account",
     text: `Hello ${user.name || "Resident"},
@@ -178,7 +188,14 @@ Your New Town Society email verification OTP is ${otp}.
 This OTP will expire in 10 minutes.
 
 If you did not try to login, please contact the society office.`
-  }, `Verification OTP for ${user.email}`);
+  };
+
+  if(options.waitForDelivery){
+    await sendMailNow(mailOptions, `Verification OTP for ${user.email}`);
+    return;
+  }
+
+  sendMailInBackground(mailOptions, `Verification OTP for ${user.email}`);
 }
 
 
@@ -202,13 +219,13 @@ app.post("/login", async(req,res)=>{
     }
 
     try{
-      await sendEmailVerificationOtp(user);
+      await sendEmailVerificationOtp(user, { waitForDelivery: true });
     }catch(err){
       console.log("Email verification OTP error:", err.message);
       return res.status(500).json({
         success:false,
         verificationRequired:true,
-        message:"Could not send verification OTP. Try again later."
+        message:err.message || "Could not send verification OTP. Try again later."
       });
     }
 
@@ -399,7 +416,7 @@ async function sendPasswordResetLink(req, res){
 
     console.log("Password reset link saved for:", cleanEmail);
 
-    sendMailInBackground({
+    await sendMailNow({
       to: cleanEmail,
       subject: "Reset your New Town Society password",
       text: `Hello ${user.name || "Resident"},
@@ -413,7 +430,7 @@ This link expires in 15 minutes. If you did not request this, please ignore this
     res.send("Password reset link sent");
   } catch (error) {
     console.log("Send reset link error:", error);
-    res.status(500).send("Could not send reset link");
+    res.status(500).send(error.message || "Could not send reset link");
   }
 }
 
