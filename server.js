@@ -117,6 +117,16 @@ function monthToNumber(month){
   return new Date(Date.parse(month +" 1, 2020")).getMonth() + 1;
 }
 
+function moneyToPaise(value){
+  const amount = Number(value);
+  if(!Number.isFinite(amount)) return 0;
+  return Math.round(amount * 100);
+}
+
+function paiseToMoney(paise){
+  return Math.round(Number(paise || 0)) / 100;
+}
+
 function normalizeEmail(email){
   return String(email || "").trim().toLowerCase();
 }
@@ -958,11 +968,43 @@ Please pay within 5 days 🙏`
   }
 });
 
-app.post("/create-order", async (req, res) => {
-  const { amount } = req.body;
+app.post("/create-order", auth, async (req, res) => {
+  const { amount, paymentId } = req.body;
+  const amountPaise = moneyToPaise(amount);
+
+  if (amountPaise <= 0) {
+    return res.status(400).json({ error: "Enter a valid amount" });
+  }
+
+  if (!paymentId) {
+    return res.status(400).json({ error: "Payment is required" });
+  }
+
+  const member = await Member.findOne({
+    flatNumber: req.user.flat,
+    "payments._id": paymentId
+  });
+
+  if (!member) {
+    return res.status(404).json({ error: "Payment not found" });
+  }
+
+  const payment = member.payments.find(p => p._id.toString() === paymentId);
+
+  if (!payment || payment.status === "paid") {
+    return res.status(400).json({ error: "This due is already paid" });
+  }
+
+  const pendingTotalPaise = member.payments
+    .filter(p => p.status !== "paid")
+    .reduce((sum, p) => sum + moneyToPaise(p.amount), 0);
+
+  if (amountPaise > pendingTotalPaise) {
+    return res.status(400).json({ error: "Amount cannot exceed pending due" });
+  }
 
   const options = {
-    amount: amount * 100,
+    amount: amountPaise,
     currency: "INR",
     receipt: "receipt_" + Date.now()
   };
@@ -982,15 +1024,16 @@ app.post("/verify-payment", async (req, res) => {
   try {
     console.log("🔥 BODY RECEIVED:", req.body);
 
-    const { 
-      paymentId, 
-      razorpay_payment_id, 
-      razorpay_order_id, 
-      razorpay_signature 
+    const {
+      paymentId,
+      razorpay_payment_id,
+      razorpay_order_id,
+      razorpay_signature,
+      paidAmount
     } = req.body;
 
     // ❌ check missing fields
-    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+    if (!paymentId || !razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
       console.log("❌ Missing payment data");
       return res.status(400).json({ error: "Invalid payment data" });
     }
@@ -1036,38 +1079,120 @@ app.post("/verify-payment", async (req, res) => {
       return res.status(404).json({ error: "Payment not found" });
     }
 
-    // ✅ UPDATE DB
-    await Member.updateOne(
-      { "payments._id": paymentId },
-      {
-        $set: {
-          "payments.$.status": "paid",
-          "payments.$.paidDate": new Date()
-        }
-      }
+    if (payment.status === "paid") {
+      console.log("❌ Payment already paid");
+      return res.status(400).json({ error: "This due is already paid" });
+    }
+
+    const amountPaise = moneyToPaise(paidAmount ?? payment.amount);
+
+    if (amountPaise <= 0) {
+      return res.status(400).json({ error: "Enter a valid amount" });
+    }
+
+    const pendingPayments = member.payments.filter(
+      p => p.status !== "paid" && moneyToPaise(p.amount) > 0
     );
+    const pendingTotalPaise = pendingPayments.reduce(
+      (sum, p) => sum + moneyToPaise(p.amount),
+      0
+    );
+
+    if (amountPaise > pendingTotalPaise) {
+      return res.status(400).json({ error: "Amount cannot exceed pending due" });
+    }
+
+    let order;
+    try {
+      order = await razorpay.orders.fetch(razorpay_order_id);
+    } catch (error) {
+      console.log("❌ Razorpay order fetch failed:", error.message);
+      return res.status(400).json({ error: "Payment order could not be verified" });
+    }
+
+    if (Number(order.amount) !== amountPaise) {
+      console.log("❌ Amount mismatch:", order.amount, amountPaise);
+      return res.status(400).json({ error: "Payment amount mismatch" });
+    }
+
+    const selectedPayment = pendingPayments.find(
+      p => p._id.toString() === paymentId
+    );
+    const orderedPendingPayments = [
+      selectedPayment,
+      ...pendingPayments.filter(p => p._id.toString() !== paymentId)
+    ].filter(Boolean);
+
+    let remainingPaise = amountPaise;
+    const paidDate = new Date();
+    const appliedPayments = [];
+
+    for (const pendingPayment of orderedPendingPayments) {
+      if (remainingPaise <= 0) break;
+
+      const duePaise = moneyToPaise(pendingPayment.amount);
+      if (duePaise <= 0) continue;
+
+      const appliedPaise = Math.min(duePaise, remainingPaise);
+      const appliedAmount = paiseToMoney(appliedPaise);
+
+      if (appliedPaise >= duePaise) {
+        pendingPayment.status = "paid";
+        pendingPayment.paidDate = paidDate;
+        appliedPayments.push({
+          _id: pendingPayment._id,
+          month: pendingPayment.month,
+          year: pendingPayment.year,
+          amount: appliedAmount
+        });
+      } else {
+        pendingPayment.amount = paiseToMoney(duePaise - appliedPaise);
+        member.payments.push({
+          month: pendingPayment.month,
+          year: pendingPayment.year,
+          amount: appliedAmount,
+          status: "paid",
+          paidDate
+        });
+        appliedPayments.push(member.payments[member.payments.length - 1]);
+      }
+
+      remainingPaise -= appliedPaise;
+    }
+
+    if (remainingPaise > 0) {
+      return res.status(400).json({ error: "Amount cannot exceed pending due" });
+    }
+
+    await member.save();
 
     console.log("✅ DB UPDATED");
 
-    // 🔄 GET UPDATED DATA
-    const updatedMember = await Member.findOne({
-      "payments._id": paymentId
-    });
-
-    const updatedPayment = updatedMember.payments.find(
-      p => p._id.toString() === paymentId
+    const paidTotal = paiseToMoney(amountPaise);
+    const receiptPayment = appliedPayments.length === 1
+      ? appliedPayments[0]
+      : {
+          _id: razorpay_payment_id,
+          month: "Multiple dues",
+          year: new Date().getFullYear(),
+          amount: paidTotal
+        };
+    const remainingDue = member.payments.reduce(
+      (sum, p) => p.status !== "paid" ? sum + Number(p.amount || 0) : sum,
+      0
     );
 
     // 📄 generate bill
-    const billFile = await generateBill(updatedMember, updatedPayment);
+    const billFile = await generateBill(member, receiptPayment);
 
     // 📲 send whatsapp
     await sendWhatsApp(
-      formatPhone(updatedMember.phone),
+      formatPhone(member.phone),
       `✅ Payment Received!
 
-📅 Month: ${updatedPayment.month}
-💰 Amount: ₹${updatedPayment.amount}
+📅 Month: ${receiptPayment.month}
+💰 Amount: ₹${paidTotal}
+⏳ Remaining Due: ₹${remainingDue}
 
 📄 Download Bill:
 http://localhost:5000/bills/${billFile}
@@ -1077,7 +1202,7 @@ Thank you 🙏`
 
     console.log("✅ WhatsApp sent");
 
-    res.json({ success: true });
+    res.json({ success: true, paidAmount: paidTotal, remainingDue });
 
   } catch (err) {
     console.log("❌ ERROR:", err);
