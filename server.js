@@ -127,6 +127,15 @@ function paiseToMoney(paise){
   return Math.round(Number(paise || 0)) / 100;
 }
 
+function getRazorpayMode(){
+  const keyId = process.env.RAZORPAY_KEY_ID || "";
+
+  if(keyId.startsWith("rzp_live_")) return "live";
+  if(keyId.startsWith("rzp_test_")) return "test";
+
+  return keyId ? "unknown" : "missing";
+}
+
 function normalizeEmail(email){
   return String(email || "").trim().toLowerCase();
 }
@@ -1020,6 +1029,15 @@ app.post("/create-order", auth, async (req, res) => {
   }
 });
 
+app.get("/payment-config", auth, (req, res) => {
+  const keyId = process.env.RAZORPAY_KEY_ID || "";
+
+  res.json({
+    razorpayKeyId: keyId,
+    mode: getRazorpayMode()
+  });
+});
+
 app.post("/verify-payment", async (req, res) => {
   try {
     console.log("🔥 BODY RECEIVED:", req.body);
@@ -1338,7 +1356,8 @@ app.get("/health", (req, res) => {
     emailUser: maskEmail(process.env.EMAIL_USER),
     emailPassConfigured: Boolean(process.env.EMAIL_PASS),
     mailRelay: shouldUseMailRelay() ? getMailRelayUrl() : null,
-    razorpayConfigured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
+    razorpayConfigured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+    razorpayMode: getRazorpayMode()
   });
 });
 
