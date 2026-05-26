@@ -414,8 +414,10 @@ Please pay as soon as possible 🙏`
 });
 
 // ================= MEMBERS =================
-app.get("/members", auth, async (req, res) => {
-  const members = await Member.find();
+app.get("/members", auth, adminOnly, async (req, res) => {
+  const members = await Member.find().select(
+    "-password -otp -otpExpiry -emailVerificationOtp -emailVerificationExpiry -passwordResetTokenHash -passwordResetExpiry"
+  );
 
   const updatedMembers = members.map(m => {
     let profileDue = 0;
@@ -836,7 +838,7 @@ app.post("/pay-now", auth, adminOnly, async(req,res)=>{
 
 
 // ================= PENDING =================
-app.get("/pending", auth, async(req,res)=>{
+app.get("/pending", auth, adminOnly, async(req,res)=>{
   const members=await Member.find();
 
   let list=[];
