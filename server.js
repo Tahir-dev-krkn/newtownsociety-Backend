@@ -16,7 +16,7 @@ const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const Complaint = require("./models/Complaint");
 
-require("dotenv").config({ override: true });
+require("dotenv").config();
 
 
 const client = twilio(
