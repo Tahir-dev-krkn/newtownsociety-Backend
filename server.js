@@ -24,6 +24,24 @@ const client = twilio(
   process.env.TWILIO_AUTH
 );
 
+const TWILIO_SANDBOX_FROM = "whatsapp:+14155238886";
+const WHATSAPP_FROM = normalizeWhatsAppAddress(
+  process.env.TWILIO_WHATSAPP_FROM,
+  TWILIO_SANDBOX_FROM
+);
+const BACKEND_PUBLIC_URL = String(
+  process.env.BACKEND_PUBLIC_URL ||
+  process.env.PUBLIC_BACKEND_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  ""
+).replace(/\/+$/, "");
+const APP_PUBLIC_URL = String(
+  process.env.APP_PUBLIC_URL ||
+  process.env.FRONTEND_PUBLIC_URL ||
+  process.env.NEXT_PUBLIC_APP_URL ||
+  "https://newtwnsociety.com"
+).replace(/\/+$/, "");
+
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET
@@ -40,6 +58,7 @@ cron.schedule("0 10 * * *", async () => {
   console.log("⏰ Running auto reminder...");
 
   const members = await Member.find();
+  const today = new Date().toDateString();
 
   for (let m of members) {
 
@@ -63,6 +82,9 @@ cron.schedule("0 10 * * *", async () => {
 Hello ${m.name},
 
 You have pending maintenance of ₹${profileDue}.
+
+Open the app to pay:
+${APP_PUBLIC_URL}
 
 Please pay as soon as possible 🙏`
   );
@@ -407,6 +429,9 @@ Hello ${member.name},
 
 You have pending maintenance of ₹${profileDue}.
 
+Open the app to pay:
+${APP_PUBLIC_URL}
+
 Please pay as soon as possible 🙏`
   );
 
@@ -634,6 +659,9 @@ app.post("/add-due", auth, adminOnly, async(req,res)=>{
 
 📅 ${month} ${year}
 💰 Amount: ₹${amount}
+
+Open the app to pay:
+${APP_PUBLIC_URL}
 
 Please pay on time 🙏`
 );
@@ -963,6 +991,9 @@ cron.schedule("0 0 1 * *", async () => {
 
 💰 ₹${m.monthlyMaintenance}
 
+Open the app to pay:
+${APP_PUBLIC_URL}
+
 Please pay within 5 days 🙏`
 );
 
@@ -1204,6 +1235,7 @@ app.post("/verify-payment", async (req, res) => {
 
     // 📄 generate bill
     const billFile = await generateBill(member, receiptPayment);
+    const billUrl = getBillUrl(billFile);
 
     // 📲 send whatsapp
     await sendWhatsApp(
@@ -1214,8 +1246,11 @@ app.post("/verify-payment", async (req, res) => {
 💰 Amount: ₹${paidTotal}
 ⏳ Remaining Due: ₹${remainingDue}
 
-📄 Download Bill:
-http://localhost:5000/bills/${billFile}
+${billUrl ? `📄 Download Bill:
+${billUrl}
+` : ""}
+Open the app:
+${APP_PUBLIC_URL}
 
 Thank you 🙏`
     );
@@ -1233,7 +1268,7 @@ Thank you 🙏`
 async function sendWhatsApp(to, message) {
   try {
     const msg = await client.messages.create({
-      from: "whatsapp:+14155238886",
+      from: WHATSAPP_FROM,
       to: "whatsapp:" + to,
       body: message
     });
@@ -1245,9 +1280,14 @@ async function sendWhatsApp(to, message) {
 }
 
 app.get("/test-whatsapp", async (req, res) => {
+  const providedSecret = req.headers["x-test-secret"] || req.query.secret;
+
+  if(!process.env.TWILIO_TEST_SECRET || providedSecret !== process.env.TWILIO_TEST_SECRET){
+    return res.status(404).send("Not found");
+  }
 
   await sendWhatsApp(
-    "+918670433655",  // 👈 PUT YOUR NUMBER
+    formatPhone(req.query.to || process.env.TWILIO_TEST_TO || "+918670433655"),
     "🔥 WhatsApp working from your app!"
   );
 
@@ -1264,6 +1304,18 @@ function formatPhone(phone) {
   }
 
   return "+91" + phone;
+}
+
+function normalizeWhatsAppAddress(value, fallback) {
+  const raw = String(value || fallback || "").trim();
+  if(!raw) return "";
+
+  return raw.startsWith("whatsapp:") ? raw : `whatsapp:${raw}`;
+}
+
+function getBillUrl(fileName) {
+  if(!BACKEND_PUBLIC_URL || !fileName) return "";
+  return `${BACKEND_PUBLIC_URL}/bills/${encodeURIComponent(fileName)}`;
 }
 
 app.use("/bills", express.static("bills"));
