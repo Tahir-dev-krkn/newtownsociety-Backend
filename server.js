@@ -436,7 +436,7 @@ app.post("/send-reminder", auth, adminOnly, async (req, res) => {
     return res.send("No pending amount");
   }
 
-  await sendWhatsApp(
+  const reminderResult = await sendWhatsApp(
     formatPhone(member.phone),
     `❗ Reminder
 
@@ -459,7 +459,11 @@ Please pay as soon as possible 🙏`
     }
   );
 
-  res.send("Reminder sent");
+  if(!reminderResult.ok){
+    return res.status(500).send(`Reminder failed: ${reminderResult.error || reminderResult.code || "Twilio rejected the message"}`);
+  }
+
+  res.send(`Reminder queued: ${reminderResult.sid}`);
 });
 
 // ================= MEMBERS =================
@@ -1280,7 +1284,7 @@ app.post("/verify-payment", async (req, res) => {
     const billUrl = getBillUrl(billFile);
 
     // 📲 send whatsapp
-    await sendWhatsApp(
+    const whatsappResult = await sendWhatsApp(
       formatPhone(member.phone),
       `✅ Payment Received!
 
@@ -1308,9 +1312,13 @@ Thank you 🙏`
       }
     );
 
-    console.log("✅ WhatsApp sent");
+    if(whatsappResult.ok){
+      console.log("✅ WhatsApp sent", whatsappResult.sid);
+    } else {
+      console.log("❌ WhatsApp payment receipt failed:", whatsappResult.error || whatsappResult.code);
+    }
 
-    res.json({ success: true, paidAmount: paidTotal, remainingDue });
+    res.json({ success: true, paidAmount: paidTotal, remainingDue, whatsapp: whatsappResult });
 
   } catch (err) {
     console.log("❌ ERROR:", err);
@@ -1343,11 +1351,7 @@ async function sendWhatsApp(to, message, options = {}) {
 }
 
 app.get("/test-whatsapp", async (req, res) => {
-  const providedSecret = req.headers["x-test-secret"] || req.query.secret;
-
-  if(!process.env.TWILIO_TEST_SECRET || providedSecret !== process.env.TWILIO_TEST_SECRET){
-    return res.status(404).send("Not found");
-  }
+  if(!verifyTestSecret(req, res)) return;
 
   const result = await sendWhatsApp(
     formatPhone(req.query.to || process.env.TWILIO_TEST_TO || "+918670433655"),
@@ -1359,6 +1363,32 @@ app.get("/test-whatsapp", async (req, res) => {
   }
 
   res.json(result);
+});
+
+app.get("/test-whatsapp-status", async (req, res) => {
+  try {
+    if(!verifyTestSecret(req, res)) return;
+
+    const sid = String(req.query.sid || "").trim();
+    if(!sid) return res.status(400).json({ ok: false, error: "Message SID is required" });
+
+    const message = await client.messages(sid).fetch();
+
+    res.json({
+      ok: true,
+      sid: message.sid,
+      status: message.status,
+      errorCode: message.errorCode,
+      errorMessage: message.errorMessage,
+      direction: message.direction,
+      from: message.from,
+      to: message.to,
+      dateCreated: message.dateCreated,
+      dateSent: message.dateSent
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message, code: err.code });
+  }
 });
 
 function formatPhone(phone) {
@@ -1378,6 +1408,17 @@ function normalizeWhatsAppAddress(value, fallback) {
   if(!raw) return "";
 
   return raw.startsWith("whatsapp:") ? raw : `whatsapp:${raw}`;
+}
+
+function verifyTestSecret(req, res) {
+  const providedSecret = req.headers["x-test-secret"] || req.query.secret;
+
+  if(!process.env.TWILIO_TEST_SECRET || providedSecret !== process.env.TWILIO_TEST_SECRET){
+    res.status(404).send("Not found");
+    return false;
+  }
+
+  return true;
 }
 
 function getBillUrl(fileName) {
