@@ -1335,8 +1335,10 @@ async function sendWhatsApp(to, message, options = {}) {
     const msg = await client.messages.create(payload);
 
     console.log("✅ Message sent:", msg.sid);
+    return { ok: true, sid: msg.sid, status: msg.status };
   } catch (err) {
     console.log("❌ Error:", err.message);
+    return { ok: false, error: err.message, code: err.code };
   }
 }
 
@@ -1347,12 +1349,16 @@ app.get("/test-whatsapp", async (req, res) => {
     return res.status(404).send("Not found");
   }
 
-  await sendWhatsApp(
+  const result = await sendWhatsApp(
     formatPhone(req.query.to || process.env.TWILIO_TEST_TO || "+918670433655"),
     "🔥 WhatsApp working from your app!"
   );
 
-  res.send("Message sent");
+  if(!result.ok){
+    return res.status(500).json(result);
+  }
+
+  res.json(result);
 });
 
 function formatPhone(phone) {
