@@ -41,6 +41,12 @@ const APP_PUBLIC_URL = String(
   process.env.NEXT_PUBLIC_APP_URL ||
   "https://newtwnsociety.com"
 ).replace(/\/+$/, "");
+const TWILIO_TEMPLATES = {
+  reminder: process.env.TWILIO_TEMPLATE_REMINDER_SID,
+  dueAdded: process.env.TWILIO_TEMPLATE_DUE_ADDED_SID,
+  monthlyDue: process.env.TWILIO_TEMPLATE_MONTHLY_DUE_SID,
+  paymentReceived: process.env.TWILIO_TEMPLATE_PAYMENT_RECEIVED_SID
+};
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -87,6 +93,15 @@ Open the app to pay:
 ${APP_PUBLIC_URL}
 
 Please pay as soon as possible 🙏`
+    ,
+    {
+      contentSid: TWILIO_TEMPLATES.reminder,
+      variables: {
+        "1": m.name,
+        "2": String(profileDue),
+        "3": APP_PUBLIC_URL
+      }
+    }
   );
 
   m.lastReminder = new Date();   // ✅ SAVE TIME
@@ -433,6 +448,15 @@ Open the app to pay:
 ${APP_PUBLIC_URL}
 
 Please pay as soon as possible 🙏`
+    ,
+    {
+      contentSid: TWILIO_TEMPLATES.reminder,
+      variables: {
+        "1": member.name,
+        "2": String(profileDue),
+        "3": APP_PUBLIC_URL
+      }
+    }
   );
 
   res.send("Reminder sent");
@@ -664,6 +688,16 @@ Open the app to pay:
 ${APP_PUBLIC_URL}
 
 Please pay on time 🙏`
+  ,
+  {
+    contentSid: TWILIO_TEMPLATES.dueAdded,
+    variables: {
+      "1": month,
+      "2": String(year),
+      "3": String(amount),
+      "4": APP_PUBLIC_URL
+    }
+  }
 );
 
   res.send("Due added");
@@ -995,6 +1029,14 @@ Open the app to pay:
 ${APP_PUBLIC_URL}
 
 Please pay within 5 days 🙏`
+  ,
+  {
+    contentSid: TWILIO_TEMPLATES.monthlyDue,
+    variables: {
+      "1": String(m.monthlyMaintenance),
+      "2": APP_PUBLIC_URL
+    }
+  }
 );
 
         console.log(`✅ Bill added for ${m.name}`);
@@ -1253,6 +1295,17 @@ Open the app:
 ${APP_PUBLIC_URL}
 
 Thank you 🙏`
+      ,
+      {
+        contentSid: TWILIO_TEMPLATES.paymentReceived,
+        variables: {
+          "1": String(receiptPayment.month),
+          "2": String(paidTotal),
+          "3": String(remainingDue),
+          "4": billUrl || APP_PUBLIC_URL,
+          "5": APP_PUBLIC_URL
+        }
+      }
     );
 
     console.log("✅ WhatsApp sent");
@@ -1265,13 +1318,21 @@ Thank you 🙏`
   }
 });
 
-async function sendWhatsApp(to, message) {
+async function sendWhatsApp(to, message, options = {}) {
   try {
-    const msg = await client.messages.create({
+    const payload = {
       from: WHATSAPP_FROM,
-      to: "whatsapp:" + to,
-      body: message
-    });
+      to: normalizeWhatsAppAddress(to)
+    };
+
+    if(options.contentSid){
+      payload.contentSid = options.contentSid;
+      payload.contentVariables = JSON.stringify(options.variables || {});
+    } else {
+      payload.body = message;
+    }
+
+    const msg = await client.messages.create(payload);
 
     console.log("✅ Message sent:", msg.sid);
   } catch (err) {
