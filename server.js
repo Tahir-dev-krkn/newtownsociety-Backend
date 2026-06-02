@@ -709,8 +709,8 @@ Please pay on time 🙏`
   {
     contentSid: TWILIO_TEMPLATES.dueAdded,
     variables: {
-      "1": month,
-      "2": String(year),
+      "1": m.name,
+      "2": `${month} ${year}`,
       "3": String(amount),
       "4": APP_PUBLIC_URL
     }
@@ -1050,8 +1050,10 @@ Please pay within 5 days 🙏`
   {
     contentSid: TWILIO_TEMPLATES.monthlyDue,
     variables: {
-      "1": String(m.monthlyMaintenance),
-      "2": APP_PUBLIC_URL
+      "1": m.name,
+      "2": `${currentMonth} ${currentYear}`,
+      "3": String(m.monthlyMaintenance),
+      "4": APP_PUBLIC_URL
     }
   }
 );
@@ -1316,11 +1318,10 @@ Thank you 🙏`
       {
         contentSid: TWILIO_TEMPLATES.paymentReceived,
         variables: {
-          "1": String(receiptPayment.month),
+          "1": member.name,
           "2": String(paidTotal),
           "3": String(remainingDue),
-          "4": billUrl || APP_PUBLIC_URL,
-          "5": APP_PUBLIC_URL
+          "4": APP_PUBLIC_URL
         }
       }
     );
