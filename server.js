@@ -42,10 +42,23 @@ const APP_PUBLIC_URL = String(
   "https://newtwnsociety.com"
 ).replace(/\/+$/, "");
 const TWILIO_TEMPLATES = {
-  reminder: process.env.TWILIO_TEMPLATE_REMINDER_SID,
-  dueAdded: process.env.TWILIO_TEMPLATE_DUE_ADDED_SID,
-  monthlyDue: process.env.TWILIO_TEMPLATE_MONTHLY_DUE_SID,
-  paymentReceived: process.env.TWILIO_TEMPLATE_PAYMENT_RECEIVED_SID
+  reminder: firstEnv(
+    "TWILIO_TEMPLATE_REMINDER_SID",
+    "TWILIO_TEMPLATE_BALANCE_UPDATE_SID",
+    "TWILIO_TEMPLATE_MAINTENANCE_REMINDER_SID"
+  ),
+  dueAdded: firstEnv(
+    "TWILIO_TEMPLATE_DUE_ADDED_SID",
+    "TWILIO_TEMPLATE_DUE_UPDATE_SID"
+  ),
+  monthlyDue: firstEnv(
+    "TWILIO_TEMPLATE_MONTHLY_DUE_SID",
+    "TWILIO_TEMPLATE_MONTHLY_UPDATE_SID"
+  ),
+  paymentReceived: firstEnv(
+    "TWILIO_TEMPLATE_PAYMENT_RECEIVED_SID",
+    "TWILIO_TEMPLATE_PAYMENT_RECEIPT_SID"
+  )
 };
 
 const razorpay = new Razorpay({
@@ -1353,9 +1366,22 @@ async function sendWhatsApp(to, message, options = {}) {
 app.get("/test-whatsapp", async (req, res) => {
   if(!verifyTestSecret(req, res)) return;
 
+  const template = String(req.query.template || "").trim();
+  const to = formatPhone(req.query.to || process.env.TWILIO_TEST_TO || "+918670433655");
+  const templateOptions = getTestTemplateOptions(template);
+
+  if(template && !templateOptions){
+    return res.status(400).json({
+      ok: false,
+      error: "Unknown or unconfigured template",
+      configuredTemplates: getTwilioTemplateDiagnostics()
+    });
+  }
+
   const result = await sendWhatsApp(
-    formatPhone(req.query.to || process.env.TWILIO_TEST_TO || "+918670433655"),
-    "🔥 WhatsApp working from your app!"
+    to,
+    "WhatsApp working from New Town Society.",
+    templateOptions || {}
   );
 
   if(!result.ok){
@@ -1363,6 +1389,19 @@ app.get("/test-whatsapp", async (req, res) => {
   }
 
   res.json(result);
+});
+
+app.get("/twilio-diagnostics", (req, res) => {
+  if(!verifyTestSecret(req, res)) return;
+
+  res.json({
+    ok: true,
+    whatsappFromConfigured: Boolean(process.env.TWILIO_WHATSAPP_FROM),
+    usingSandboxSender: WHATSAPP_FROM === TWILIO_SANDBOX_FROM,
+    appPublicUrl: APP_PUBLIC_URL,
+    backendPublicUrl: BACKEND_PUBLIC_URL,
+    templates: getTwilioTemplateDiagnostics()
+  });
 });
 
 app.get("/test-whatsapp-status", async (req, res) => {
@@ -1408,6 +1447,78 @@ function normalizeWhatsAppAddress(value, fallback) {
   if(!raw) return "";
 
   return raw.startsWith("whatsapp:") ? raw : `whatsapp:${raw}`;
+}
+
+function firstEnv(...names) {
+  for(const name of names){
+    const value = process.env[name];
+    if(value) return value;
+  }
+
+  return "";
+}
+
+function maskSid(sid) {
+  const value = String(sid || "");
+  if(!value) return "";
+
+  return `${value.slice(0, 4)}...${value.slice(-6)}`;
+}
+
+function getTwilioTemplateDiagnostics() {
+  return Object.fromEntries(
+    Object.entries(TWILIO_TEMPLATES).map(([name, sid]) => [
+      name,
+      {
+        configured: Boolean(sid),
+        sid: maskSid(sid)
+      }
+    ])
+  );
+}
+
+function getTestTemplateOptions(template) {
+  const templates = {
+    reminder: {
+      contentSid: TWILIO_TEMPLATES.reminder,
+      variables: {
+        "1": "Soham",
+        "2": "3598",
+        "3": APP_PUBLIC_URL
+      }
+    },
+    dueAdded: {
+      contentSid: TWILIO_TEMPLATES.dueAdded,
+      variables: {
+        "1": "June",
+        "2": "2026",
+        "3": "1800",
+        "4": APP_PUBLIC_URL
+      }
+    },
+    monthlyDue: {
+      contentSid: TWILIO_TEMPLATES.monthlyDue,
+      variables: {
+        "1": "1800",
+        "2": APP_PUBLIC_URL
+      }
+    },
+    paymentReceived: {
+      contentSid: TWILIO_TEMPLATES.paymentReceived,
+      variables: {
+        "1": "June 2026",
+        "2": "1800",
+        "3": "0",
+        "4": APP_PUBLIC_URL,
+        "5": APP_PUBLIC_URL
+      }
+    }
+  };
+
+  const options = templates[template];
+  if(!options || !options.contentSid) return null;
+
+  return options;
 }
 
 function verifyTestSecret(req, res) {
