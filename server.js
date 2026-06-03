@@ -1475,7 +1475,10 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
     }
 
     try {
-      const senders = await client.messaging.v2.channels.senders.list({ limit: 20 });
+      const senders = await client.messaging.v2.channelsSenders.list({
+        channel: "whatsapp",
+        limit: 20
+      });
       result.whatsappSenders = senders.map(formatTwilioSender);
     } catch (err) {
       result.errors.whatsappSenders = maskTwilioError(err);
