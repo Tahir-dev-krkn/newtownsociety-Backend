@@ -1491,8 +1491,8 @@ function getTestTemplateOptions(template) {
     dueAdded: {
       contentSid: TWILIO_TEMPLATES.dueAdded,
       variables: {
-        "1": "June",
-        "2": "2026",
+        "1": "Soham",
+        "2": "June 2026",
         "3": "1800",
         "4": APP_PUBLIC_URL
       }
@@ -1500,18 +1500,19 @@ function getTestTemplateOptions(template) {
     monthlyDue: {
       contentSid: TWILIO_TEMPLATES.monthlyDue,
       variables: {
-        "1": "1800",
-        "2": APP_PUBLIC_URL
+        "1": "Soham",
+        "2": "June 2026",
+        "3": "1800",
+        "4": APP_PUBLIC_URL
       }
     },
     paymentReceived: {
       contentSid: TWILIO_TEMPLATES.paymentReceived,
       variables: {
-        "1": "June 2026",
+        "1": "Soham",
         "2": "1800",
         "3": "0",
-        "4": APP_PUBLIC_URL,
-        "5": APP_PUBLIC_URL
+        "4": APP_PUBLIC_URL
       }
     }
   };
