@@ -1442,6 +1442,7 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
       requestedMessage: null,
       recentMessages: [],
       whatsappSenders: [],
+      contentTemplates: [],
       alerts: [],
       errors: {}
     };
@@ -1482,6 +1483,16 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
       result.whatsappSenders = senders.map(formatTwilioSender);
     } catch (err) {
       result.errors.whatsappSenders = maskTwilioError(err);
+    }
+
+    try {
+      const configuredTemplateSids = new Set(Object.values(TWILIO_TEMPLATES).filter(Boolean));
+      const contents = await client.content.v1.contentAndApprovals.list({ limit: 100 });
+      result.contentTemplates = contents
+        .filter(content => configuredTemplateSids.has(content.sid))
+        .map(formatTwilioContentApproval);
+    } catch (err) {
+      result.errors.contentTemplates = maskTwilioError(err);
     }
 
     try {
@@ -1577,6 +1588,17 @@ function formatTwilioSender(sender) {
     offlineReasons: sender.offlineReasons,
     dateCreated: sender.dateCreated,
     dateUpdated: sender.dateUpdated
+  };
+}
+
+function formatTwilioContentApproval(content) {
+  return {
+    sid: maskSid(content.sid),
+    friendlyName: content.friendlyName,
+    language: content.language,
+    approvalRequests: content.approvalRequests,
+    dateCreated: content.dateCreated,
+    dateUpdated: content.dateUpdated
   };
 }
 
