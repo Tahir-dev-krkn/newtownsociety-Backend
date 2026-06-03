@@ -1431,6 +1431,75 @@ app.get("/test-whatsapp-status", async (req, res) => {
   }
 });
 
+app.get("/twilio-live-diagnostics", async (req, res) => {
+  try {
+    if(!verifyTestSecret(req, res)) return;
+
+    const sid = String(req.query.sid || "").trim();
+    const result = {
+      ok: true,
+      account: null,
+      requestedMessage: null,
+      recentMessages: [],
+      whatsappSenders: [],
+      alerts: [],
+      errors: {}
+    };
+
+    try {
+      const account = await client.api.accounts(process.env.TWILIO_SID).fetch();
+      result.account = {
+        sid: maskSid(account.sid),
+        status: account.status,
+        type: account.type,
+        friendlyName: account.friendlyName
+      };
+    } catch (err) {
+      result.errors.account = maskTwilioError(err);
+    }
+
+    if(sid){
+      try {
+        const message = await client.messages(sid).fetch();
+        result.requestedMessage = formatTwilioMessage(message);
+      } catch (err) {
+        result.errors.requestedMessage = maskTwilioError(err);
+      }
+    }
+
+    try {
+      const messages = await client.messages.list({ limit: 10 });
+      result.recentMessages = messages.map(formatTwilioMessage);
+    } catch (err) {
+      result.errors.recentMessages = maskTwilioError(err);
+    }
+
+    try {
+      const senders = await client.messaging.v2.channels.senders.list({ limit: 20 });
+      result.whatsappSenders = senders.map(formatTwilioSender);
+    } catch (err) {
+      result.errors.whatsappSenders = maskTwilioError(err);
+    }
+
+    try {
+      const alerts = await client.monitor.v1.alerts.list({ logLevel: "error", limit: 10 });
+      result.alerts = alerts.map(alert => ({
+        sid: maskSid(alert.sid),
+        errorCode: alert.errorCode,
+        alertText: alert.alertText,
+        resourceSid: maskSid(alert.resourceSid),
+        dateGenerated: alert.dateGenerated
+      }));
+    } catch (err) {
+      result.errors.alerts = maskTwilioError(err);
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message, code: err.code });
+  }
+});
+
 function formatPhone(phone) {
   phone = phone.replace(/\s+/g, "");
 
@@ -1464,6 +1533,48 @@ function maskSid(sid) {
   if(!value) return "";
 
   return `${value.slice(0, 4)}...${value.slice(-6)}`;
+}
+
+function maskPhone(value) {
+  const raw = String(value || "");
+  if(!raw) return "";
+
+  return raw.replace(/(\+?\d{2,4})\d+(\d{4})/g, "$1***$2");
+}
+
+function maskTwilioError(err) {
+  return {
+    code: err.code,
+    status: err.status,
+    message: err.message
+  };
+}
+
+function formatTwilioMessage(message) {
+  return {
+    sid: maskSid(message.sid),
+    status: message.status,
+    errorCode: message.errorCode,
+    errorMessage: message.errorMessage,
+    direction: message.direction,
+    from: maskPhone(message.from),
+    to: maskPhone(message.to),
+    dateCreated: message.dateCreated,
+    dateSent: message.dateSent
+  };
+}
+
+function formatTwilioSender(sender) {
+  return {
+    sid: maskSid(sender.sid),
+    senderId: maskPhone(sender.senderId),
+    status: sender.status,
+    profileName: sender.profileName,
+    wabaId: sender.wabaId,
+    offlineReasons: sender.offlineReasons,
+    dateCreated: sender.dateCreated,
+    dateUpdated: sender.dateUpdated
+  };
 }
 
 function getTwilioTemplateDiagnostics() {
