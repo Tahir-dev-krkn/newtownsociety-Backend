@@ -29,9 +29,19 @@ const MemberSchema = new mongoose.Schema({
       month: String,
       year: Number,
       amount: Number,
+      description: String,
+      chargeType: {
+        type: String,
+        default: "maintenance"
+      },
+      paymentMethod: String,
       status: {
         type: String,
         default: "pending"
+      },
+      createdAt: {
+        type: Date,
+        default: Date.now
       },
       paidDate: Date
     }

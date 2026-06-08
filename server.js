@@ -680,44 +680,76 @@ app.post("/verify-otp", async (req, res) => {
 
 // ================= ADD DUE =================
 app.post("/add-due", auth, adminOnly, async(req,res)=>{
-  const {memberId,month,year,amount}=req.body;
+  try {
+    const { memberId, month, year, amount, description, chargeType } = req.body;
+    const cleanAmount = Number(amount);
+    const isCustomCharge = chargeType === "custom";
+    const cleanDescription = String(description || "").trim().slice(0, 160);
+    const cleanMonth = isCustomCharge ? "Custom charge" : String(month || "").trim();
+    const cleanYear = Number(year || new Date().getFullYear());
 
-  const m = await Member.findById(memberId);
+    if (!memberId || !Number.isFinite(cleanAmount) || cleanAmount <= 0) {
+      return res.status(400).send("Enter a valid charge amount");
+    }
 
-  m.payments.push({
-  month,
-  year,
-  amount,
-  status: "pending",   // 🔥 ADD THIS
-  createdAt: new Date(2020,0,1)
-});
+    if (!isCustomCharge && (!cleanMonth || !cleanYear)) {
+      return res.status(400).send("Select a valid due range");
+    }
 
-  await m.save();
+    if (isCustomCharge && !cleanDescription) {
+      return res.status(400).send("Enter charge remarks");
+    }
 
-  await sendWhatsApp(
-  formatPhone(m.phone),
-  `❗ New Due Added
+    const m = await Member.findById(memberId);
 
-📅 ${month} ${year}
-💰 Amount: ₹${amount}
+    if (!m) {
+      return res.status(404).send("Member not found");
+    }
+
+    const label = isCustomCharge
+      ? cleanDescription
+      : `Maintenance charge for ${cleanMonth} ${cleanYear}`;
+
+    m.payments.push({
+      month: cleanMonth,
+      year: cleanYear,
+      amount: cleanAmount,
+      description: label,
+      chargeType: isCustomCharge ? "custom" : "maintenance",
+      status: "pending",
+      createdAt: new Date()
+    });
+
+    await m.save();
+
+    await sendWhatsApp(
+      formatPhone(m.phone),
+      `❗ New Due Added
+
+📅 ${label}
+💰 Amount: ₹${cleanAmount}
 
 Open the app to pay:
 ${APP_PUBLIC_URL}
 
 Please pay on time 🙏`
-  ,
-  {
-    contentSid: TWILIO_TEMPLATES.dueAdded,
-    variables: {
-      "1": m.name,
-      "2": `${month} ${year}`,
-      "3": String(amount),
-      "4": APP_PUBLIC_URL
-    }
-  }
-);
+      ,
+      {
+        contentSid: TWILIO_TEMPLATES.dueAdded,
+        variables: {
+          "1": m.name,
+          "2": label,
+          "3": String(cleanAmount),
+          "4": APP_PUBLIC_URL
+        }
+      }
+    );
 
-  res.send("Due added");
+    res.send("Due added");
+  } catch (error) {
+    console.log("Add due error:", error);
+    res.status(500).send("Charge could not be added");
+  }
 });
 
 app.post("/add-member", auth,adminOnly, async (req, res) => {
@@ -794,6 +826,9 @@ app.get("/all-payments", auth, adminOnly, async (req, res) => {
         month: p.month,
         year: p.year,
         amount: p.amount,
+        description: p.description,
+        chargeType: p.chargeType,
+        paymentMethod: p.paymentMethod,
         status: p.status || "pending"
       });
     });
@@ -815,6 +850,8 @@ app.post("/export-history", auth, adminOnly, async (req, res) => {
       { header: "Flat", key: "flat", width: 10 },
       { header: "Month", key: "month", width: 15 },
       { header: "Year", key: "year", width: 10 },
+      { header: "Description", key: "description", width: 32 },
+      { header: "Payment Method", key: "paymentMethod", width: 18 },
       { header: "Amount", key: "amount", width: 15 },
       { header: "Status", key: "status", width: 15 }
     ];
@@ -825,6 +862,8 @@ app.post("/export-history", auth, adminOnly, async (req, res) => {
         flat: p.flat,
         month: p.month,
         year: p.year,
+        description: p.description || "",
+        paymentMethod: p.paymentMethod || "",
         amount: p.amount,
         status: p.status
       });
@@ -915,6 +954,115 @@ app.post("/pay-now", auth, adminOnly, async(req,res)=>{
   res.send("Paid");
 });
 
+app.post("/record-cash-payment", auth, adminOnly, async(req,res)=>{
+  try {
+    const { paymentId } = req.body;
+
+    if (!paymentId) {
+      return res.status(400).send("Payment is required");
+    }
+
+    const member = await Member.findOne({ "payments._id": paymentId });
+
+    if (!member) {
+      return res.status(404).send("Payment not found");
+    }
+
+    const payment = member.payments.find(p => p._id.toString() === paymentId);
+
+    if (!payment) {
+      return res.status(404).send("Payment not found");
+    }
+
+    if (payment.status === "paid") {
+      return res.status(400).send("This due is already paid");
+    }
+
+    payment.status = "paid";
+    payment.paidDate = new Date();
+    payment.paymentMethod = "cash";
+
+    await member.save();
+
+    const remainingDue = member.payments.reduce(
+      (sum, p) => p.status !== "paid" ? sum + Number(p.amount || 0) : sum,
+      0
+    );
+    const paymentLabel = payment.description || `${payment.month} ${payment.year}`;
+    const billFile = await generateBill(member, payment);
+    const billUrl = getBillUrl(billFile);
+
+    const whatsappResult = await sendWhatsApp(
+      formatPhone(member.phone),
+      `✅ Cash Payment Received!
+
+📅 Charge: ${paymentLabel}
+💰 Amount: ₹${payment.amount}
+⏳ Remaining Due: ₹${remainingDue}
+
+${billUrl ? `📄 Download Bill:
+${billUrl}
+` : ""}
+Open the app:
+${APP_PUBLIC_URL}
+
+Thank you 🙏`,
+      {
+        contentSid: TWILIO_TEMPLATES.paymentReceived,
+        variables: {
+          "1": member.name,
+          "2": String(payment.amount),
+          "3": String(remainingDue),
+          "4": APP_PUBLIC_URL
+        }
+      }
+    );
+
+    if(!whatsappResult.ok){
+      console.log("Cash payment WhatsApp failed:", whatsappResult);
+    }
+
+    res.send("Cash payment recorded");
+  } catch (error) {
+    console.log("Cash payment error:", error);
+    res.status(500).send("Cash payment could not be recorded");
+  }
+});
+
+app.delete("/due/:paymentId", auth, adminOnly, async(req,res)=>{
+  try {
+    const { paymentId } = req.params;
+
+    if (!paymentId) {
+      return res.status(400).send("Payment is required");
+    }
+
+    const member = await Member.findOne({ "payments._id": paymentId });
+
+    if (!member) {
+      return res.status(404).send("Due not found");
+    }
+
+    const payment = member.payments.find(p => p._id.toString() === paymentId);
+
+    if (!payment) {
+      return res.status(404).send("Due not found");
+    }
+
+    if (payment.status === "paid") {
+      return res.status(400).send("Paid receipts cannot be deleted");
+    }
+
+    member.payments.pull(payment._id);
+    await member.save();
+
+    res.send("Due deleted");
+  } catch (error) {
+    console.log("Delete due error:", error);
+    res.status(500).send("Due could not be deleted");
+  }
+});
+
 
 // ================= PENDING =================
 app.get("/pending", auth, adminOnly, async(req,res)=>{
@@ -971,18 +1119,19 @@ app.get("/export", auth, adminOnly, async (req, res) => {
     { header: "Flat", key: "flat" },
     { header: "Month", key: "month" },
     { header: "Year", key: "year" },
+    { header: "Description", key: "description" },
+    { header: "Payment Method", key: "paymentMethod" },
     { header: "Amount", key: "amount" },
     { header: "Status", key: "status" }
   ];
 
   members.forEach(m => {
     m.payments.forEach(p => {
+      const monthNumber = monthToNumber(p.month);
 
-      const pDate = new Date(
-        p.year,
-        monthToNumber(p.month) - 1,
-        1
-      );
+      const pDate = Number.isFinite(monthNumber)
+        ? new Date(p.year, monthNumber - 1, 1)
+        : new Date(p.createdAt || Date.now());
 
       if (pDate >= start && pDate <= end) {
         ws.addRow({
@@ -990,6 +1139,8 @@ app.get("/export", auth, adminOnly, async (req, res) => {
           flat: m.flatNumber,
           month: p.month,
           year: p.year,
+          description: p.description || "",
+          paymentMethod: p.paymentMethod || "",
           amount: p.amount,
           status: p.status
         });
@@ -1251,11 +1402,15 @@ app.post("/verify-payment", async (req, res) => {
       if (appliedPaise >= duePaise) {
         pendingPayment.status = "paid";
         pendingPayment.paidDate = paidDate;
+        pendingPayment.paymentMethod = "online";
         appliedPayments.push({
           _id: pendingPayment._id,
           month: pendingPayment.month,
           year: pendingPayment.year,
-          amount: appliedAmount
+          amount: appliedAmount,
+          description: pendingPayment.description,
+          chargeType: pendingPayment.chargeType,
+          paymentMethod: pendingPayment.paymentMethod
         });
       } else {
         pendingPayment.amount = paiseToMoney(duePaise - appliedPaise);
@@ -1263,7 +1418,11 @@ app.post("/verify-payment", async (req, res) => {
           month: pendingPayment.month,
           year: pendingPayment.year,
           amount: appliedAmount,
+          description: pendingPayment.description,
+          chargeType: pendingPayment.chargeType,
+          paymentMethod: "online",
           status: "paid",
+          createdAt: pendingPayment.createdAt || paidDate,
           paidDate
         });
         appliedPayments.push(member.payments[member.payments.length - 1]);
@@ -1287,7 +1446,8 @@ app.post("/verify-payment", async (req, res) => {
           _id: razorpay_payment_id,
           month: "Multiple dues",
           year: new Date().getFullYear(),
-          amount: paidTotal
+          amount: paidTotal,
+          description: "Multiple dues payment"
         };
     const remainingDue = member.payments.reduce(
       (sum, p) => p.status !== "paid" ? sum + Number(p.amount || 0) : sum,
@@ -1298,12 +1458,15 @@ app.post("/verify-payment", async (req, res) => {
     const billFile = await generateBill(member, receiptPayment);
     const billUrl = getBillUrl(billFile);
 
+    const paymentLabel = receiptPayment.description
+      || `${receiptPayment.month} ${receiptPayment.year}`;
+
     // 📲 send whatsapp
     const whatsappResult = await sendWhatsApp(
       formatPhone(member.phone),
       `✅ Payment Received!
 
-📅 Month: ${receiptPayment.month}
+📅 Charge: ${paymentLabel}
 💰 Amount: ₹${paidTotal}
 ⏳ Remaining Due: ₹${remainingDue}
 
@@ -1699,6 +1862,12 @@ function generateBill(member, payment) {
 
     doc.text(`Month: ${payment.month}`);
     doc.text(`Year: ${payment.year}`);
+    if (payment.description) {
+      doc.text(`Description: ${payment.description}`);
+    }
+    if (payment.paymentMethod) {
+      doc.text(`Payment Method: ${payment.paymentMethod}`);
+    }
     doc.text(`Amount: ₹${payment.amount}`);
     doc.text(`Payment ID: ${payment._id}`);
     doc.text(`Date: ${new Date().toLocaleString()}`);
