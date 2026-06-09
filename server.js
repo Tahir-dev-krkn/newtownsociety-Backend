@@ -1736,98 +1736,111 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
     if(!verifyTestSecret(req, res)) return;
 
     const sid = String(req.query.sid || "").trim();
-    if(!client) return res.status(500).json({ ok: false, error: "Twilio is not configured" });
-
-    const result = {
-      ok: true,
-      config: {
-        accountSidConfigured: Boolean(TWILIO_ACCOUNT_SID),
-        accountSidLooksValid: TWILIO_ACCOUNT_SID.startsWith("AC"),
-        authTokenConfigured: Boolean(TWILIO_AUTH_TOKEN),
-        whatsappFromConfigured: Boolean(process.env.TWILIO_WHATSAPP_FROM),
-        whatsappFrom: maskPhone(WHATSAPP_FROM),
-        usingSandboxSender: WHATSAPP_FROM === TWILIO_SANDBOX_FROM,
-        messagingServiceConfigured: Boolean(TWILIO_MESSAGING_SERVICE_SID),
-        messagingServiceLooksValid: !TWILIO_MESSAGING_SERVICE_SID || TWILIO_MESSAGING_SERVICE_SID.startsWith("MG"),
-        messagingServiceSid: maskSid(TWILIO_MESSAGING_SERVICE_SID),
-        statusCallbackUrl: getTwilioStatusCallbackUrl(),
-        templates: getTwilioTemplateDiagnostics()
-      },
-      account: null,
-      requestedMessage: null,
-      recentMessages: [],
-      whatsappSenders: [],
-      contentTemplates: [],
-      alerts: [],
-      errors: {}
-    };
-
-    try {
-      const account = await client.api.accounts(TWILIO_ACCOUNT_SID).fetch();
-      result.account = {
-        sid: maskSid(account.sid),
-        status: account.status,
-        type: account.type,
-        friendlyName: account.friendlyName
-      };
-    } catch (err) {
-      result.errors.account = maskTwilioError(err);
-    }
-
-    if(sid){
-      try {
-        const message = await client.messages(sid).fetch();
-        result.requestedMessage = formatTwilioMessage(message);
-      } catch (err) {
-        result.errors.requestedMessage = maskTwilioError(err);
-      }
-    }
-
-    try {
-      const messages = await client.messages.list({ limit: 10 });
-      result.recentMessages = messages.map(formatTwilioMessage);
-    } catch (err) {
-      result.errors.recentMessages = maskTwilioError(err);
-    }
-
-    try {
-      const senders = await client.messaging.v2.channelsSenders.list({
-        channel: "whatsapp",
-        limit: 20
-      });
-      result.whatsappSenders = senders.map(formatTwilioSender);
-    } catch (err) {
-      result.errors.whatsappSenders = maskTwilioError(err);
-    }
-
-    try {
-      const configuredTemplateSids = new Set(Object.values(TWILIO_TEMPLATES).filter(Boolean));
-      const contents = await client.content.v1.contentAndApprovals.list({ limit: 100 });
-      result.contentTemplates = contents
-        .filter(content => configuredTemplateSids.has(content.sid))
-        .map(formatTwilioContentApproval);
-    } catch (err) {
-      result.errors.contentTemplates = maskTwilioError(err);
-    }
-
-    try {
-      const alerts = await client.monitor.v1.alerts.list({ logLevel: "error", limit: 10 });
-      result.alerts = alerts.map(alert => ({
-        sid: maskSid(alert.sid),
-        errorCode: alert.errorCode,
-        alertText: alert.alertText,
-        resourceSid: maskSid(alert.resourceSid),
-        dateGenerated: alert.dateGenerated
-      }));
-    } catch (err) {
-      result.errors.alerts = maskTwilioError(err);
-    }
-
-    res.json(result);
+    res.json(await buildTwilioLiveDiagnostics(sid));
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message, code: err.code });
   }
 });
+
+app.get("/admin/twilio-live-diagnostics", auth, adminOnly, async (req, res) => {
+  try {
+    const sid = String(req.query.sid || "").trim();
+    res.json(await buildTwilioLiveDiagnostics(sid));
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message, code: err.code });
+  }
+});
+
+async function buildTwilioLiveDiagnostics(sid = "") {
+  if(!client) return { ok: false, error: "Twilio is not configured" };
+
+  const result = {
+    ok: true,
+    config: {
+      accountSidConfigured: Boolean(TWILIO_ACCOUNT_SID),
+      accountSidLooksValid: TWILIO_ACCOUNT_SID.startsWith("AC"),
+      authTokenConfigured: Boolean(TWILIO_AUTH_TOKEN),
+      whatsappFromConfigured: Boolean(process.env.TWILIO_WHATSAPP_FROM),
+      whatsappFrom: maskPhone(WHATSAPP_FROM),
+      usingSandboxSender: WHATSAPP_FROM === TWILIO_SANDBOX_FROM,
+      messagingServiceConfigured: Boolean(TWILIO_MESSAGING_SERVICE_SID),
+      messagingServiceLooksValid: !TWILIO_MESSAGING_SERVICE_SID || TWILIO_MESSAGING_SERVICE_SID.startsWith("MG"),
+      messagingServiceSid: maskSid(TWILIO_MESSAGING_SERVICE_SID),
+      statusCallbackUrl: getTwilioStatusCallbackUrl(),
+      templates: getTwilioTemplateDiagnostics()
+    },
+    account: null,
+    requestedMessage: null,
+    recentMessages: [],
+    whatsappSenders: [],
+    contentTemplates: [],
+    alerts: [],
+    errors: {}
+  };
+
+  try {
+    const account = await client.api.accounts(TWILIO_ACCOUNT_SID).fetch();
+    result.account = {
+      sid: maskSid(account.sid),
+      status: account.status,
+      type: account.type,
+      friendlyName: account.friendlyName
+    };
+  } catch (err) {
+    result.errors.account = maskTwilioError(err);
+  }
+
+  if(sid){
+    try {
+      const message = await client.messages(sid).fetch();
+      result.requestedMessage = formatTwilioMessage(message);
+    } catch (err) {
+      result.errors.requestedMessage = maskTwilioError(err);
+    }
+  }
+
+  try {
+    const messages = await client.messages.list({ limit: 10 });
+    result.recentMessages = messages.map(formatTwilioMessage);
+  } catch (err) {
+    result.errors.recentMessages = maskTwilioError(err);
+  }
+
+  try {
+    const senders = await client.messaging.v2.channelsSenders.list({
+      channel: "whatsapp",
+      limit: 20
+    });
+    result.whatsappSenders = senders.map(formatTwilioSender);
+  } catch (err) {
+    result.errors.whatsappSenders = maskTwilioError(err);
+  }
+
+  try {
+    const configuredTemplateSids = new Set(Object.values(TWILIO_TEMPLATES).filter(Boolean));
+    const contents = await client.content.v1.contentAndApprovals.list({ limit: 100 });
+    result.contentTemplates = contents
+      .filter(content => configuredTemplateSids.has(content.sid))
+      .map(formatTwilioContentApproval);
+  } catch (err) {
+    result.errors.contentTemplates = maskTwilioError(err);
+  }
+
+  try {
+    const alerts = await client.monitor.v1.alerts.list({ logLevel: "error", limit: 10 });
+    result.alerts = alerts.map(alert => ({
+      sid: maskSid(alert.sid),
+      errorCode: alert.errorCode,
+      alertText: alert.alertText,
+      resourceSid: maskSid(alert.resourceSid),
+      dateGenerated: alert.dateGenerated
+    }));
+  } catch (err) {
+    result.errors.alerts = maskTwilioError(err);
+  }
+
+  return result;
+}
 
 function formatPhone(phone) {
   phone = String(phone || "").replace(/\s+/g, "");
