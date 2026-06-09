@@ -19,15 +19,21 @@ const Complaint = require("./models/Complaint");
 require("dotenv").config();
 
 
-const client = twilio(
-  process.env.TWILIO_SID,
-  process.env.TWILIO_AUTH
-);
+const TWILIO_ACCOUNT_SID = firstEnv("TWILIO_SID", "TWILIO_ACCOUNT_SID");
+const TWILIO_AUTH_TOKEN = firstEnv("TWILIO_AUTH", "TWILIO_AUTH_TOKEN");
+const client = TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+  : null;
 
 const TWILIO_SANDBOX_FROM = "whatsapp:+14155238886";
 const WHATSAPP_FROM = normalizeWhatsAppAddress(
   process.env.TWILIO_WHATSAPP_FROM,
   TWILIO_SANDBOX_FROM
+);
+const TWILIO_MESSAGING_SERVICE_SID = firstEnv(
+  "TWILIO_MESSAGING_SERVICE_SID",
+  "TWILIO_MESSAGE_SERVICE_SID",
+  "TWILIO_MESSAGING_SID"
 );
 const BACKEND_PUBLIC_URL = String(
   process.env.BACKEND_PUBLIC_URL ||
@@ -44,19 +50,24 @@ const APP_PUBLIC_URL = String(
 const TWILIO_TEMPLATES = {
   reminder: firstEnv(
     "TWILIO_TEMPLATE_REMINDER_SID",
+    "TWILIO_TEMPLATE_BALANCE_DUE_SID",
     "TWILIO_TEMPLATE_BALANCE_UPDATE_SID",
     "TWILIO_TEMPLATE_MAINTENANCE_REMINDER_SID"
   ),
   dueAdded: firstEnv(
     "TWILIO_TEMPLATE_DUE_ADDED_SID",
-    "TWILIO_TEMPLATE_DUE_UPDATE_SID"
+    "TWILIO_TEMPLATE_CHARGE_ADDED_SID",
+    "TWILIO_TEMPLATE_DUE_UPDATE_SID",
+    "TWILIO_TEMPLATE_CHARGE_NOTICE_SID"
   ),
   monthlyDue: firstEnv(
     "TWILIO_TEMPLATE_MONTHLY_DUE_SID",
+    "TWILIO_TEMPLATE_MONTHLY_BILL_SID",
     "TWILIO_TEMPLATE_MONTHLY_UPDATE_SID"
   ),
   paymentReceived: firstEnv(
     "TWILIO_TEMPLATE_PAYMENT_RECEIVED_SID",
+    "TWILIO_TEMPLATE_PAYMENT_RECORDED_SID",
     "TWILIO_TEMPLATE_PAYMENT_RECEIPT_SID"
   )
 };
@@ -68,6 +79,7 @@ const razorpay = new Razorpay({
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 app.use(cors());
 
 const SECRET = process.env.JWT_SECRET;
@@ -1544,27 +1556,104 @@ Thank you 🙏`
 
 async function sendWhatsApp(to, message, options = {}) {
   try {
+    if(!client || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN){
+      return {
+        ok: false,
+        error: "Twilio Account SID/Auth Token is not configured. Use the Account SID starting with AC, not the User SID starting with US."
+      };
+    }
+
+    if(!TWILIO_ACCOUNT_SID.startsWith("AC")){
+      return {
+        ok: false,
+        error: "Twilio Account SID looks wrong. It must start with AC."
+      };
+    }
+
+    const cleanTo = normalizeWhatsAppAddress(to);
+    if(!cleanTo){
+      return { ok: false, error: "Recipient WhatsApp phone number is missing" };
+    }
+
+    if(!TWILIO_MESSAGING_SERVICE_SID && !WHATSAPP_FROM){
+      return { ok: false, error: "Twilio WhatsApp sender is not configured" };
+    }
+
+    if(TWILIO_MESSAGING_SERVICE_SID && !TWILIO_MESSAGING_SERVICE_SID.startsWith("MG")){
+      return {
+        ok: false,
+        error: "Twilio Messaging Service SID looks wrong. It must start with MG, or remove it and use TWILIO_WHATSAPP_FROM."
+      };
+    }
+
+    const contentSid = String(options.contentSid || "").trim();
     const payload = {
-      from: WHATSAPP_FROM,
-      to: normalizeWhatsAppAddress(to)
+      to: cleanTo
     };
 
-    if(options.contentSid){
-      payload.contentSid = options.contentSid;
+    if(TWILIO_MESSAGING_SERVICE_SID){
+      payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+    } else {
+      payload.from = WHATSAPP_FROM;
+    }
+
+    const statusCallback = getTwilioStatusCallbackUrl();
+    if(statusCallback){
+      payload.statusCallback = statusCallback;
+    }
+
+    if(contentSid){
+      payload.contentSid = contentSid;
       payload.contentVariables = JSON.stringify(options.variables || {});
     } else {
       payload.body = message;
     }
 
+    console.log("📲 Twilio send request:", {
+      to: maskPhone(payload.to),
+      from: maskPhone(payload.from),
+      messagingServiceSid: maskSid(payload.messagingServiceSid),
+      contentSid: maskSid(payload.contentSid),
+      mode: payload.contentSid ? "template" : "body",
+      statusCallback: Boolean(payload.statusCallback)
+    });
+
     const msg = await client.messages.create(payload);
 
-    console.log("✅ Message sent:", msg.sid);
-    return { ok: true, sid: msg.sid, status: msg.status };
+    console.log("✅ Twilio message queued:", msg.sid, msg.status);
+    return {
+      ok: true,
+      sid: msg.sid,
+      status: msg.status,
+      to: maskPhone(payload.to),
+      from: maskPhone(payload.from),
+      messagingServiceSid: maskSid(payload.messagingServiceSid),
+      contentSid: maskSid(payload.contentSid)
+    };
   } catch (err) {
-    console.log("❌ Error:", err.message);
+    console.log("❌ Twilio send error:", {
+      code: err.code,
+      status: err.status,
+      message: err.message
+    });
     return { ok: false, error: err.message, code: err.code };
   }
 }
+
+app.post("/twilio-status", (req, res) => {
+  const status = req.body.MessageStatus || req.body.SmsStatus;
+
+  console.log("📬 Twilio delivery status:", {
+    sid: maskSid(req.body.MessageSid || req.body.SmsSid),
+    status,
+    errorCode: req.body.ErrorCode,
+    errorMessage: req.body.ErrorMessage,
+    to: maskPhone(req.body.To),
+    from: maskPhone(req.body.From)
+  });
+
+  res.sendStatus(204);
+});
 
 app.get("/test-whatsapp", async (req, res) => {
   if(!verifyTestSecret(req, res)) return;
@@ -1599,10 +1688,18 @@ app.get("/twilio-diagnostics", (req, res) => {
 
   res.json({
     ok: true,
+    accountSidConfigured: Boolean(TWILIO_ACCOUNT_SID),
+    accountSidLooksValid: TWILIO_ACCOUNT_SID.startsWith("AC"),
+    authTokenConfigured: Boolean(TWILIO_AUTH_TOKEN),
     whatsappFromConfigured: Boolean(process.env.TWILIO_WHATSAPP_FROM),
     usingSandboxSender: WHATSAPP_FROM === TWILIO_SANDBOX_FROM,
+    whatsappFrom: maskPhone(WHATSAPP_FROM),
+    messagingServiceConfigured: Boolean(TWILIO_MESSAGING_SERVICE_SID),
+    messagingServiceLooksValid: !TWILIO_MESSAGING_SERVICE_SID || TWILIO_MESSAGING_SERVICE_SID.startsWith("MG"),
+    messagingServiceSid: maskSid(TWILIO_MESSAGING_SERVICE_SID),
     appPublicUrl: APP_PUBLIC_URL,
     backendPublicUrl: BACKEND_PUBLIC_URL,
+    statusCallbackUrl: getTwilioStatusCallbackUrl(),
     templates: getTwilioTemplateDiagnostics()
   });
 });
@@ -1613,6 +1710,7 @@ app.get("/test-whatsapp-status", async (req, res) => {
 
     const sid = String(req.query.sid || "").trim();
     if(!sid) return res.status(400).json({ ok: false, error: "Message SID is required" });
+    if(!client) return res.status(500).json({ ok: false, error: "Twilio is not configured" });
 
     const message = await client.messages(sid).fetch();
 
@@ -1638,8 +1736,23 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
     if(!verifyTestSecret(req, res)) return;
 
     const sid = String(req.query.sid || "").trim();
+    if(!client) return res.status(500).json({ ok: false, error: "Twilio is not configured" });
+
     const result = {
       ok: true,
+      config: {
+        accountSidConfigured: Boolean(TWILIO_ACCOUNT_SID),
+        accountSidLooksValid: TWILIO_ACCOUNT_SID.startsWith("AC"),
+        authTokenConfigured: Boolean(TWILIO_AUTH_TOKEN),
+        whatsappFromConfigured: Boolean(process.env.TWILIO_WHATSAPP_FROM),
+        whatsappFrom: maskPhone(WHATSAPP_FROM),
+        usingSandboxSender: WHATSAPP_FROM === TWILIO_SANDBOX_FROM,
+        messagingServiceConfigured: Boolean(TWILIO_MESSAGING_SERVICE_SID),
+        messagingServiceLooksValid: !TWILIO_MESSAGING_SERVICE_SID || TWILIO_MESSAGING_SERVICE_SID.startsWith("MG"),
+        messagingServiceSid: maskSid(TWILIO_MESSAGING_SERVICE_SID),
+        statusCallbackUrl: getTwilioStatusCallbackUrl(),
+        templates: getTwilioTemplateDiagnostics()
+      },
       account: null,
       requestedMessage: null,
       recentMessages: [],
@@ -1650,7 +1763,7 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
     };
 
     try {
-      const account = await client.api.accounts(process.env.TWILIO_SID).fetch();
+      const account = await client.api.accounts(TWILIO_ACCOUNT_SID).fetch();
       result.account = {
         sid: maskSid(account.sid),
         status: account.status,
@@ -1717,7 +1830,9 @@ app.get("/twilio-live-diagnostics", async (req, res) => {
 });
 
 function formatPhone(phone) {
-  phone = phone.replace(/\s+/g, "");
+  phone = String(phone || "").replace(/\s+/g, "");
+
+  if(!phone) return "";
 
   if (phone.startsWith("+")) return phone;
 
@@ -1729,7 +1844,7 @@ function formatPhone(phone) {
 }
 
 function normalizeWhatsAppAddress(value, fallback) {
-  const raw = String(value || fallback || "").trim();
+  const raw = String(value || fallback || "").trim().replace(/\s+/g, "");
   if(!raw) return "";
 
   return raw.startsWith("whatsapp:") ? raw : `whatsapp:${raw}`;
@@ -1737,11 +1852,17 @@ function normalizeWhatsAppAddress(value, fallback) {
 
 function firstEnv(...names) {
   for(const name of names){
-    const value = process.env[name];
+    const value = String(process.env[name] || "").trim();
     if(value) return value;
   }
 
   return "";
+}
+
+function getTwilioStatusCallbackUrl() {
+  if(!BACKEND_PUBLIC_URL) return "";
+
+  return `${BACKEND_PUBLIC_URL}/twilio-status`;
 }
 
 function maskSid(sid) {
