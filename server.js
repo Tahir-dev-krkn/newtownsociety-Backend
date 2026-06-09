@@ -956,7 +956,7 @@ app.post("/pay-now", auth, adminOnly, async(req,res)=>{
 
 app.post("/record-cash-payment", auth, adminOnly, async(req,res)=>{
   try {
-    const { paymentId } = req.body;
+    const { paymentId, amount } = req.body;
 
     if (!paymentId) {
       return res.status(400).send("Payment is required");
@@ -978,9 +978,46 @@ app.post("/record-cash-payment", auth, adminOnly, async(req,res)=>{
       return res.status(400).send("This due is already paid");
     }
 
-    payment.status = "paid";
-    payment.paidDate = new Date();
-    payment.paymentMethod = "cash";
+    const duePaise = moneyToPaise(payment.amount);
+    const amountPaise = amount === undefined || amount === null || amount === ""
+      ? duePaise
+      : moneyToPaise(amount);
+
+    if (duePaise <= 0) {
+      return res.status(400).send("Due amount is invalid");
+    }
+
+    if (amountPaise <= 0) {
+      return res.status(400).send("Cash amount must be more than zero");
+    }
+
+    if (amountPaise > duePaise) {
+      return res.status(400).send("Cash amount cannot exceed this due");
+    }
+
+    const paidDate = new Date();
+    const paidAmount = paiseToMoney(amountPaise);
+    let receiptPayment = payment;
+
+    if (amountPaise === duePaise) {
+      payment.status = "paid";
+      payment.paidDate = paidDate;
+      payment.paymentMethod = "cash";
+    } else {
+      payment.amount = paiseToMoney(duePaise - amountPaise);
+      member.payments.push({
+        month: payment.month,
+        year: payment.year,
+        amount: paidAmount,
+        description: payment.description,
+        chargeType: payment.chargeType,
+        paymentMethod: "cash",
+        status: "paid",
+        createdAt: payment.createdAt || paidDate,
+        paidDate
+      });
+      receiptPayment = member.payments[member.payments.length - 1];
+    }
 
     await member.save();
 
@@ -988,8 +1025,8 @@ app.post("/record-cash-payment", auth, adminOnly, async(req,res)=>{
       (sum, p) => p.status !== "paid" ? sum + Number(p.amount || 0) : sum,
       0
     );
-    const paymentLabel = payment.description || `${payment.month} ${payment.year}`;
-    const billFile = await generateBill(member, payment);
+    const paymentLabel = receiptPayment.description || `${receiptPayment.month} ${receiptPayment.year}`;
+    const billFile = await generateBill(member, receiptPayment);
     const billUrl = getBillUrl(billFile);
 
     const whatsappResult = await sendWhatsApp(
@@ -997,7 +1034,7 @@ app.post("/record-cash-payment", auth, adminOnly, async(req,res)=>{
       `✅ Cash Payment Received!
 
 📅 Charge: ${paymentLabel}
-💰 Amount: ₹${payment.amount}
+💰 Amount: ₹${paidAmount}
 ⏳ Remaining Due: ₹${remainingDue}
 
 ${billUrl ? `📄 Download Bill:
@@ -1011,7 +1048,7 @@ Thank you 🙏`,
         contentSid: TWILIO_TEMPLATES.paymentReceived,
         variables: {
           "1": member.name,
-          "2": String(payment.amount),
+          "2": String(paidAmount),
           "3": String(remainingDue),
           "4": APP_PUBLIC_URL
         }
@@ -1022,7 +1059,9 @@ Thank you 🙏`,
       console.log("Cash payment WhatsApp failed:", whatsappResult);
     }
 
-    res.send("Cash payment recorded");
+    res.send(amountPaise === duePaise
+      ? "Cash payment recorded"
+      : `Cash payment recorded. Remaining due: ₹${remainingDue}`);
   } catch (error) {
     console.log("Cash payment error:", error);
     res.status(500).send("Cash payment could not be recorded");
