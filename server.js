@@ -77,6 +77,120 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET
 });
 
+function findRecordedRazorpayPayment(member, orderId, razorpayPaymentId){
+  return member.payments.find(payment =>
+    (orderId && payment.razorpayOrderId === orderId)
+    || (razorpayPaymentId && payment.razorpayPaymentId === razorpayPaymentId)
+  );
+}
+
+function applyOnlinePayment(member, selectedPaymentId, amountPaise, references = {}){
+  const pendingPayments = member.payments.filter(
+    payment => payment.status !== "paid" && moneyToPaise(payment.amount) > 0
+  );
+  const pendingTotalPaise = pendingPayments.reduce(
+    (sum, payment) => sum + moneyToPaise(payment.amount),
+    0
+  );
+
+  if(amountPaise <= 0){
+    throw new Error("Enter a valid amount");
+  }
+
+  if(amountPaise > pendingTotalPaise){
+    throw new Error("Amount cannot exceed pending due");
+  }
+
+  const selectedPayment = pendingPayments.find(
+    payment => payment._id.toString() === selectedPaymentId
+  );
+
+  if(!selectedPayment){
+    throw new Error("Payment not found");
+  }
+
+  const orderedPendingPayments = [
+    selectedPayment,
+    ...pendingPayments.filter(payment => payment._id.toString() !== selectedPaymentId)
+  ];
+  const paidDate = new Date();
+  const appliedPayments = [];
+  let remainingPaise = amountPaise;
+
+  for(const pendingPayment of orderedPendingPayments){
+    if(remainingPaise <= 0) break;
+
+    const duePaise = moneyToPaise(pendingPayment.amount);
+    if(duePaise <= 0) continue;
+
+    const appliedPaise = Math.min(duePaise, remainingPaise);
+    const appliedAmount = paiseToMoney(appliedPaise);
+    const paymentReferences = {
+      razorpayOrderId: references.orderId,
+      razorpayPaymentId: references.paymentId
+    };
+
+    if(appliedPaise >= duePaise){
+      pendingPayment.status = "paid";
+      pendingPayment.paidDate = paidDate;
+      pendingPayment.paymentMethod = "online";
+      pendingPayment.razorpayOrderId = paymentReferences.razorpayOrderId;
+      pendingPayment.razorpayPaymentId = paymentReferences.razorpayPaymentId;
+      appliedPayments.push(pendingPayment);
+    } else {
+      pendingPayment.amount = paiseToMoney(duePaise - appliedPaise);
+      member.payments.push({
+        month: pendingPayment.month,
+        year: pendingPayment.year,
+        amount: appliedAmount,
+        description: pendingPayment.description,
+        chargeType: pendingPayment.chargeType,
+        paymentMethod: "online",
+        status: "paid",
+        createdAt: pendingPayment.createdAt || paidDate,
+        paidDate,
+        ...paymentReferences
+      });
+      appliedPayments.push(member.payments[member.payments.length - 1]);
+    }
+
+    remainingPaise -= appliedPaise;
+  }
+
+  if(remainingPaise > 0){
+    throw new Error("Amount cannot exceed pending due");
+  }
+
+  return appliedPayments;
+}
+
+async function getCapturedRazorpayPayment(orderId){
+  const [order, paymentCollection] = await Promise.all([
+    razorpay.orders.fetch(orderId),
+    razorpay.orders.fetchPayments(orderId)
+  ]);
+  const payments = paymentCollection?.items || [];
+  const capturedPayments = payments.filter(payment =>
+    payment.status === "captured" && Number(payment.amount_refunded || 0) === 0
+  );
+
+  if(order.currency !== "INR"){
+    throw new Error("Only INR orders can be reconciled");
+  }
+
+  if(order.status !== "paid" || capturedPayments.length !== 1){
+    throw new Error("Razorpay order does not have exactly one captured payment");
+  }
+
+  const payment = capturedPayments[0];
+
+  if(payment.order_id !== order.id || Number(payment.amount) !== Number(order.amount_paid)){
+    throw new Error("Razorpay payment details do not match the order");
+  }
+
+  return { order, payment };
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -1311,7 +1425,12 @@ app.post("/create-order", auth, async (req, res) => {
   const options = {
     amount: amountPaise,
     currency: "INR",
-    receipt: "receipt_" + Date.now()
+    receipt: "receipt_" + Date.now(),
+    notes: {
+      memberId: member._id.toString(),
+      flatNumber: member.flatNumber,
+      paymentId: payment._id.toString()
+    }
   };
 
   try {
@@ -1334,7 +1453,7 @@ app.get("/payment-config", auth, (req, res) => {
   });
 });
 
-app.post("/verify-payment", async (req, res) => {
+app.post("/verify-payment", auth, async (req, res) => {
   try {
     console.log("🔥 BODY RECEIVED:", req.body);
 
@@ -1375,6 +1494,7 @@ app.post("/verify-payment", async (req, res) => {
 
     // 🔍 find member
     const member = await Member.findOne({
+      flatNumber: req.user.flat,
       "payments._id": paymentId
     });
 
@@ -1398,93 +1518,56 @@ app.post("/verify-payment", async (req, res) => {
       return res.status(400).json({ error: "This due is already paid" });
     }
 
-    const amountPaise = moneyToPaise(paidAmount ?? payment.amount);
-
-    if (amountPaise <= 0) {
-      return res.status(400).json({ error: "Enter a valid amount" });
-    }
-
-    const pendingPayments = member.payments.filter(
-      p => p.status !== "paid" && moneyToPaise(p.amount) > 0
-    );
-    const pendingTotalPaise = pendingPayments.reduce(
-      (sum, p) => sum + moneyToPaise(p.amount),
-      0
-    );
-
-    if (amountPaise > pendingTotalPaise) {
-      return res.status(400).json({ error: "Amount cannot exceed pending due" });
-    }
-
-    let order;
+    let capturedOrder;
+    let capturedPayment;
     try {
-      order = await razorpay.orders.fetch(razorpay_order_id);
+      const captured = await getCapturedRazorpayPayment(razorpay_order_id);
+      capturedOrder = captured.order;
+      capturedPayment = captured.payment;
     } catch (error) {
-      console.log("❌ Razorpay order fetch failed:", error.message);
-      return res.status(400).json({ error: "Payment order could not be verified" });
+      console.log("❌ Razorpay capture verification failed:", error.message);
+      return res.status(400).json({ error: "Payment has not been captured by Razorpay" });
     }
 
-    if (Number(order.amount) !== amountPaise) {
-      console.log("❌ Amount mismatch:", order.amount, amountPaise);
+    if (capturedPayment.id !== razorpay_payment_id) {
+      return res.status(400).json({ error: "Razorpay payment does not match the order" });
+    }
+
+    const amountPaise = Number(capturedPayment.amount);
+    const requestedAmountPaise = moneyToPaise(paidAmount ?? payment.amount);
+
+    if (amountPaise <= 0 || amountPaise !== requestedAmountPaise) {
+      console.log("❌ Amount mismatch:", amountPaise, requestedAmountPaise);
       return res.status(400).json({ error: "Payment amount mismatch" });
     }
 
-    const selectedPayment = pendingPayments.find(
-      p => p._id.toString() === paymentId
+    const orderNotes = capturedOrder.notes || {};
+    if(
+      (orderNotes.memberId && String(orderNotes.memberId) !== member._id.toString())
+      || (orderNotes.flatNumber && String(orderNotes.flatNumber) !== member.flatNumber)
+      || (orderNotes.paymentId && String(orderNotes.paymentId) !== paymentId)
+    ){
+      return res.status(400).json({ error: "Payment order belongs to a different due" });
+    }
+
+    const recordedPayment = findRecordedRazorpayPayment(
+      member,
+      razorpay_order_id,
+      razorpay_payment_id
     );
-    const orderedPendingPayments = [
-      selectedPayment,
-      ...pendingPayments.filter(p => p._id.toString() !== paymentId)
-    ].filter(Boolean);
 
-    let remainingPaise = amountPaise;
-    const paidDate = new Date();
-    const appliedPayments = [];
-
-    for (const pendingPayment of orderedPendingPayments) {
-      if (remainingPaise <= 0) break;
-
-      const duePaise = moneyToPaise(pendingPayment.amount);
-      if (duePaise <= 0) continue;
-
-      const appliedPaise = Math.min(duePaise, remainingPaise);
-      const appliedAmount = paiseToMoney(appliedPaise);
-
-      if (appliedPaise >= duePaise) {
-        pendingPayment.status = "paid";
-        pendingPayment.paidDate = paidDate;
-        pendingPayment.paymentMethod = "online";
-        appliedPayments.push({
-          _id: pendingPayment._id,
-          month: pendingPayment.month,
-          year: pendingPayment.year,
-          amount: appliedAmount,
-          description: pendingPayment.description,
-          chargeType: pendingPayment.chargeType,
-          paymentMethod: pendingPayment.paymentMethod
-        });
-      } else {
-        pendingPayment.amount = paiseToMoney(duePaise - appliedPaise);
-        member.payments.push({
-          month: pendingPayment.month,
-          year: pendingPayment.year,
-          amount: appliedAmount,
-          description: pendingPayment.description,
-          chargeType: pendingPayment.chargeType,
-          paymentMethod: "online",
-          status: "paid",
-          createdAt: pendingPayment.createdAt || paidDate,
-          paidDate
-        });
-        appliedPayments.push(member.payments[member.payments.length - 1]);
-      }
-
-      remainingPaise -= appliedPaise;
+    if(recordedPayment){
+      return res.json({
+        success: true,
+        alreadyRecorded: true,
+        paidAmount: Number(recordedPayment.amount || 0)
+      });
     }
 
-    if (remainingPaise > 0) {
-      return res.status(400).json({ error: "Amount cannot exceed pending due" });
-    }
+    const appliedPayments = applyOnlinePayment(member, paymentId, amountPaise, {
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id
+    });
 
     await member.save();
 
@@ -1551,6 +1634,173 @@ Thank you 🙏`
   } catch (err) {
     console.log("❌ ERROR:", err);
     res.status(500).json({ error: "Verification failed" });
+  }
+});
+
+app.get("/admin/razorpay-order/:orderId", auth, adminOnly, async(req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    if(!/^order_[A-Za-z0-9]+$/.test(orderId || "")){
+      return res.status(400).json({ error: "Invalid Razorpay order ID" });
+    }
+
+    const order = await razorpay.orders.fetch(orderId);
+    const paymentCollection = await razorpay.orders.fetchPayments(orderId);
+    const payments = (paymentCollection?.items || []).map(payment => ({
+      id: payment.id,
+      amount: paiseToMoney(payment.amount),
+      amountRefunded: paiseToMoney(payment.amount_refunded),
+      status: payment.status,
+      captured: payment.captured,
+      orderId: payment.order_id,
+      createdAt: payment.created_at
+        ? new Date(payment.created_at * 1000).toISOString()
+        : null
+    }));
+
+    res.json({
+      id: order.id,
+      amount: paiseToMoney(order.amount),
+      amountPaid: paiseToMoney(order.amount_paid),
+      amountDue: paiseToMoney(order.amount_due),
+      currency: order.currency,
+      status: order.status,
+      notes: order.notes || {},
+      payments
+    });
+  } catch(error) {
+    console.log("Razorpay order diagnostic failed:", error.message);
+    res.status(400).json({ error: "Razorpay order could not be fetched" });
+  }
+});
+
+app.post("/admin/reconcile-razorpay-payment", auth, adminOnly, async(req, res) => {
+  try {
+    const { orderId, memberId, paymentId } = req.body;
+
+    if(!orderId || !memberId || !paymentId){
+      return res.status(400).json({
+        error: "Order, resident, and due payment are required"
+      });
+    }
+
+    const member = await Member.findOne({
+      _id: memberId,
+      "payments._id": paymentId
+    });
+
+    if(!member){
+      return res.status(404).json({ error: "Resident payment not found" });
+    }
+
+    const { order, payment } = await getCapturedRazorpayPayment(orderId);
+    const existingMember = await Member.findOne({
+      $or: [
+        { "payments.razorpayOrderId": order.id },
+        { "payments.razorpayPaymentId": payment.id }
+      ]
+    });
+
+    if(existingMember && existingMember._id.toString() !== member._id.toString()){
+      return res.status(409).json({
+        error: "This Razorpay payment is already recorded for another resident"
+      });
+    }
+
+    const recordedPayment = findRecordedRazorpayPayment(member, order.id, payment.id);
+
+    if(recordedPayment){
+      const remainingDue = member.payments.reduce(
+        (sum, item) => item.status !== "paid" ? sum + Number(item.amount || 0) : sum,
+        0
+      );
+
+      return res.json({
+        success: true,
+        alreadyRecorded: true,
+        paidAmount: Number(recordedPayment.amount || 0),
+        remainingDue
+      });
+    }
+
+    const amountPaise = Number(payment.amount);
+    const appliedPayments = applyOnlinePayment(member, paymentId, amountPaise, {
+      orderId: order.id,
+      paymentId: payment.id
+    });
+
+    await member.save();
+
+    const remainingDue = member.payments.reduce(
+      (sum, item) => item.status !== "paid" ? sum + Number(item.amount || 0) : sum,
+      0
+    );
+    const paidTotal = paiseToMoney(amountPaise);
+    const receiptPayment = appliedPayments.length === 1
+      ? appliedPayments[0]
+      : {
+          _id: payment.id,
+          month: "Multiple dues",
+          year: new Date().getFullYear(),
+          amount: paidTotal,
+          description: "Recovered Razorpay payment"
+        };
+
+    let whatsappResult = { ok: false, error: "Receipt notification was not attempted" };
+    try {
+      const billFile = await generateBill(member, receiptPayment);
+      const billUrl = getBillUrl(billFile);
+      const paymentLabel = receiptPayment.description
+        || `${receiptPayment.month} ${receiptPayment.year}`;
+
+      whatsappResult = await sendWhatsApp(
+        formatPhone(member.phone),
+        `✅ Payment Received!
+
+📅 Charge: ${paymentLabel}
+💰 Amount: ₹${paidTotal}
+⏳ Remaining Due: ₹${remainingDue}
+
+${billUrl ? `📄 Download Bill:
+${billUrl}
+` : ""}
+Open the app:
+${APP_PUBLIC_URL}
+
+Thank you 🙏`,
+        {
+          contentSid: TWILIO_TEMPLATES.paymentReceived,
+          variables: {
+            "1": member.name,
+            "2": String(paidTotal),
+            "3": String(remainingDue),
+            "4": APP_PUBLIC_URL
+          }
+        }
+      );
+    } catch(notificationError) {
+      console.log("Recovered payment receipt failed:", notificationError.message);
+      whatsappResult = { ok: false, error: notificationError.message };
+    }
+
+    res.json({
+      success: true,
+      paidAmount: paidTotal,
+      remainingDue,
+      razorpayPaymentId: payment.id,
+      whatsapp: whatsappResult,
+      appliedPayments: appliedPayments.map(item => ({
+        id: item._id,
+        amount: item.amount,
+        month: item.month,
+        year: item.year,
+        description: item.description
+      }))
+    });
+  } catch(error) {
+    console.log("Razorpay reconciliation failed:", error.message);
+    res.status(400).json({ error: error.message || "Payment could not be reconciled" });
   }
 });
 

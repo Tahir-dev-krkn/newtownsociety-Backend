@@ -35,6 +35,8 @@ const MemberSchema = new mongoose.Schema({
         default: "maintenance"
       },
       paymentMethod: String,
+      razorpayOrderId: String,
+      razorpayPaymentId: String,
       status: {
         type: String,
         default: "pending"
