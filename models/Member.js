@@ -50,4 +50,9 @@ const MemberSchema = new mongoose.Schema({
   ]
 });
 
+// 🔎 Indexes for fast login / lookup (avoids full-collection scans)
+MemberSchema.index({ flatNumber: 1 });
+MemberSchema.index({ email: 1 });
+MemberSchema.index({ "payments._id": 1 });
+
 module.exports = mongoose.model("Member", MemberSchema);

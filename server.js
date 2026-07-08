@@ -15,6 +15,7 @@ const twilio = require("twilio");
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const Complaint = require("./models/Complaint");
+const rateLimit = require("express-rate-limit");
 
 require("dotenv").config();
 
@@ -192,11 +193,40 @@ async function getCapturedRazorpayPayment(orderId){
 }
 
 const app = express();
+
+// Behind Render/Vercel proxies — needed for correct client IP in rate limiting
+app.set("trust proxy", 1);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cors());
 
+// 🔒 Throttle brute-force. Generous on /login so a whole society sharing one
+// WiFi/IP is never blocked, tighter on OTP/email endpoints where abuse matters.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,                 // plenty for a shared-IP society; still stops bots
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many attempts. Please try again in a few minutes." }
+});
+
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,                  // OTP/email endpoints: no real user needs many
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many attempts. Please try again in a few minutes." }
+});
+
 const SECRET = process.env.JWT_SECRET;
+
+if (!SECRET) {
+  console.error("❌ FATAL: JWT_SECRET is not set. Refusing to start.");
+  process.exit(1);
+}
+
+const TOKEN_TTL = process.env.JWT_EXPIRES_IN || "30d";
 
 // 🔥 AUTO REMINDER EVERY DAY AT 10 AM
 cron.schedule("0 10 * * *", async () => {
@@ -255,7 +285,11 @@ Please pay as soon as possible 🙏`
 
 // ================= DB =================
 mongoose.connect(process.env.MONGO_URI)
-.then(()=>console.log("✅ DB Connected"))
+.then(()=>{
+  console.log("✅ DB Connected");
+  // Catch up any monthly bills the cron may have missed while asleep.
+  runMonthlyBillingCatchUp();
+})
 .catch(err=>console.log(err));
 
 
@@ -470,7 +504,7 @@ If you did not try to login, please contact the society office.`
 
 
 // ================= LOGIN =================
-app.post("/login", async(req,res)=>{
+app.post("/login", loginLimiter, async(req,res)=>{
   
   const user=await Member.findOne({flatNumber:req.body.flatNumber});
   if(!user) return res.json({success:false});
@@ -506,11 +540,11 @@ app.post("/login", async(req,res)=>{
     });
   }
 
-  const token=jwt.sign({flat:user.flatNumber,role:user.role},SECRET);
+  const token=jwt.sign({flat:user.flatNumber,role:user.role},SECRET,{expiresIn:TOKEN_TTL});
   res.json({success:true,token,role:user.role});
 });
 
-app.post("/verify-email", async(req,res)=>{
+app.post("/verify-email", otpLimiter, async(req,res)=>{
   const { flatNumber, otp } = req.body;
 
   const user = await Member.findOne({ flatNumber });
@@ -538,21 +572,6 @@ app.post("/verify-email", async(req,res)=>{
   await user.save();
 
   res.json({ success:true, message:"Email verified successfully" });
-});
-
-app.get("/fix-owner-password", auth, adminOnly, async(req,res)=>{
-
-  const owner = await Member.findOne({ role: "owner" });
-
-  if(!owner){
-    return res.send("Owner not found");
-  }
-
-  owner.password = await bcrypt.hash("123456",10);
-
-  await owner.save();
-
-  res.send("Owner password fixed");
 });
 
 app.post("/send-reminder", auth, adminOnly, async (req, res) => {
@@ -666,12 +685,37 @@ app.delete("/member/:id", auth, adminOnly, async(req,res)=>{
 });
 
 app.put("/update-profile", auth, async (req, res) => {
-  const { userId, phone, email } = req.body;
+  const { phone, email } = req.body;
 
-  await Member.findByIdAndUpdate(userId, {
-    phone,
-    email
-  });
+  // 🔒 Always update the logged-in user's own record, never an arbitrary id
+  const user = await Member.findOne({ flatNumber: req.user.flat });
+
+  if (!user) {
+    return res.status(404).send("Member not found");
+  }
+
+  const cleanEmail = normalizeEmail(email);
+
+  if (cleanEmail && !/^\S+@\S+\.\S+$/.test(cleanEmail)) {
+    return res.status(400).send("Please enter a valid email address");
+  }
+
+  if (phone !== undefined) {
+    user.phone = String(phone).trim();
+  }
+
+  // Changing email must re-trigger verification for owners
+  if (cleanEmail && cleanEmail !== normalizeEmail(user.email)) {
+    user.email = cleanEmail;
+
+    if (user.role === "owner") {
+      user.emailVerified = false;
+      user.emailVerificationOtp = null;
+      user.emailVerificationExpiry = null;
+    }
+  }
+
+  await user.save();
 
   res.send("Profile updated");
 });
@@ -721,11 +765,11 @@ This link expires in 15 minutes. If you did not request this, please ignore this
   }
 }
 
-app.post("/send-reset-link", sendPasswordResetLink);
+app.post("/send-reset-link", otpLimiter, sendPasswordResetLink);
 
-app.post("/send-otp", sendPasswordResetLink);
+app.post("/send-otp", otpLimiter, sendPasswordResetLink);
 
-app.post("/reset-password", async (req, res) => {
+app.post("/reset-password", otpLimiter, async (req, res) => {
   try {
     const { email, token, newPassword } = req.body;
     const cleanEmail = normalizeEmail(email);
@@ -764,7 +808,7 @@ app.post("/reset-password", async (req, res) => {
   }
 });
 
-app.post("/verify-otp", async (req, res) => {
+app.post("/verify-otp", otpLimiter, async (req, res) => {
   try {
     const { email, otp, newPassword } = req.body;
     const cleanEmail = normalizeEmail(email);
@@ -1323,67 +1367,126 @@ app.get("/export", auth, adminOnly, async (req, res) => {
   res.end();
 });
 
-// 🔥 AUTO MONTHLY BILL (PRO VERSION)
-cron.schedule("0 0 1 * *", async () => {
-  try {
-    console.log("📅 Running monthly maintenance...");
+// 🔥 AUTO MONTHLY BILL
+// Idempotent: adds the current month's maintenance to every member who does
+// not already have it. Safe to run any number of times — a member is never
+// billed twice for the same month. Each member is isolated in its own
+// try/catch, so one failure can never stop the rest of the batch (that was
+// the old bug that billed "some members but not all").
+async function ensureMonthlyBillsForAll({ notify = false } = {}) {
+  const now = new Date();
+  const currentMonth = now.toLocaleString("default", { month: "long" });
+  const currentYear = now.getFullYear();
 
-    const now = new Date();
-    const currentMonth = now.toLocaleString("default", { month: "long" });
-    const currentYear = now.getFullYear();
+  const members = await Member.find();
+  const report = {
+    month: `${currentMonth} ${currentYear}`,
+    billed: [],
+    skipped: [],
+    failed: []
+  };
 
-    const members = await Member.find();
+  for (const m of members) {
+    try {
+      const amount = Number(m.monthlyMaintenance);
 
-    for (let m of members) {
+      // Skip anyone without a real maintenance amount (e.g. admin/staff)
+      if (!Number.isFinite(amount) || amount <= 0) {
+        report.skipped.push({ flat: m.flatNumber, reason: "no maintenance amount" });
+        continue;
+      }
 
-      // ❗ Prevent duplicate entry
-      const alreadyExists = m.payments.find(p =>
-        p.month === currentMonth && p.year === currentYear
+      const alreadyExists = (m.payments || []).some(
+        p => p.month === currentMonth && p.year === currentYear
       );
 
-      if (!alreadyExists) {
-        m.payments.push({
-          month: currentMonth,
-          year: currentYear,
-          amount: m.monthlyMaintenance,
-          status: "pending",
-          createdAt: new Date()   // 🔥 added
-        });
+      if (alreadyExists) {
+        report.skipped.push({ flat: m.flatNumber, reason: "already billed" });
+        continue;
+      }
 
-        await m.save();
+      m.payments.push({
+        month: currentMonth,
+        year: currentYear,
+        amount,
+        status: "pending",
+        createdAt: new Date()
+      });
 
-        await sendWhatsApp(
-  formatPhone(m.phone),
-  `📅 Monthly Maintenance Added
+      await m.save();
+      report.billed.push({ flat: m.flatNumber, name: m.name, amount });
+      console.log(`✅ Bill added for ${m.name} (${m.flatNumber})`);
 
-💰 ₹${m.monthlyMaintenance}
+      if (notify) {
+        // Fire-and-forget: a slow or failing WhatsApp must never block or
+        // skip the billing of the next member.
+        sendWhatsApp(
+          formatPhone(m.phone),
+          `📅 Monthly Maintenance Added
+
+💰 ₹${amount}
 
 Open the app to pay:
 ${APP_PUBLIC_URL}
 
-Please pay within 5 days 🙏`
-  ,
-  {
-    contentSid: TWILIO_TEMPLATES.monthlyDue,
-    variables: {
-      "1": m.name,
-      "2": `${currentMonth} ${currentYear}`,
-      "3": String(m.monthlyMaintenance),
-      "4": APP_PUBLIC_URL
+Please pay within 5 days 🙏`,
+          {
+            contentSid: TWILIO_TEMPLATES.monthlyDue,
+            variables: {
+              "1": m.name,
+              "2": `${currentMonth} ${currentYear}`,
+              "3": String(amount),
+              "4": APP_PUBLIC_URL
+            }
+          }
+        ).catch(err =>
+          console.log(`Monthly bill WhatsApp failed for ${m.flatNumber}:`, err.message)
+        );
+      }
+    } catch (err) {
+      report.failed.push({ flat: m.flatNumber, error: err.message });
+      console.log(`❌ Monthly bill failed for ${m.flatNumber}:`, err.message);
     }
   }
-);
 
-        console.log(`✅ Bill added for ${m.name}`);
-      } else {
-        console.log(`⚠️ Already exists for ${m.name}`);
-      }
-    }
+  console.log(
+    `🎉 Monthly billing (${report.month}): ${report.billed.length} billed, ` +
+    `${report.skipped.length} skipped, ${report.failed.length} failed`
+  );
 
-    console.log("🎉 Monthly billing completed");
+  return report;
+}
 
+// Runs on the 1st of every month (when the server happens to be awake).
+cron.schedule("0 0 1 * *", () => {
+  console.log("📅 Monthly billing cron triggered...");
+  ensureMonthlyBillsForAll({ notify: true }).catch(err =>
+    console.log("❌ Monthly billing cron error:", err.message)
+  );
+});
+
+// 🩹 Self-heal: on every startup, catch up any current-month bills that the
+// cron missed (e.g. the free-tier server was asleep at midnight on the 1st).
+// Silent by design — the existing daily 10am reminder cron notifies members
+// of any pending dues, so this avoids a WhatsApp burst on every cold start.
+async function runMonthlyBillingCatchUp() {
+  try {
+    console.log("🩹 Monthly billing catch-up on startup...");
+    await ensureMonthlyBillsForAll({ notify: false });
   } catch (err) {
-    console.log("❌ Cron Error:", err);
+    console.log("❌ Monthly billing catch-up error:", err.message);
+  }
+}
+
+// Admin can trigger billing on demand and see exactly who was billed/skipped.
+app.post("/admin/run-monthly-billing", auth, adminOnly, async (req, res) => {
+  try {
+    const notify = req.body?.notify !== false; // notify unless explicitly false
+    const report = await ensureMonthlyBillsForAll({ notify });
+    res.json({ ok: true, ...report });
+  } catch (err) {
+    console.log("Manual monthly billing failed:", err.message);
+    res.status(500).json({ ok: false, error: "Monthly billing failed" });
   }
 });
 
