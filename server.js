@@ -287,6 +287,8 @@ Please pay as soon as possible 🙏`
 mongoose.connect(process.env.MONGO_URI)
 .then(()=>{
   console.log("✅ DB Connected");
+  // Recovery path for the admin login, if ADMIN_FLAT/ADMIN_PASSWORD are set.
+  seedAdminFromEnv();
   // Catch up any monthly bills the cron may have missed while asleep — but not
   // immediately. A cold start is triggered by somebody waiting on a request
   // (usually a login), and replaying bills walks every member. Serve them first.
@@ -380,6 +382,56 @@ async function findMemberByFlat(flatNumber){
   return Member.findOne({
     flatNumber: { $regex: `^${escapeRegex(cleanFlatNumber)}$`, $options: "i" }
   });
+}
+
+// Nothing in the app can create or recover the admin login — /add-member always
+// makes owners — so the only way back in is one the operator controls: set
+// ADMIN_FLAT + ADMIN_PASSWORD in the Render dashboard and restart. Creates the
+// admin if it is missing, resets its password if it already exists, and never
+// touches a resident's account.
+async function seedAdminFromEnv(){
+  const flatNumber = String(process.env.ADMIN_FLAT || "").trim();
+  const password = String(process.env.ADMIN_PASSWORD || "");
+
+  if(!flatNumber || !password) return;
+
+  if(password.length < 8){
+    console.log("⚠️ ADMIN_PASSWORD must be at least 8 characters — admin seed skipped.");
+    return;
+  }
+
+  try{
+    const existing = await findMemberByFlat(flatNumber);
+
+    // Converting an owner would hand their flat — and their payment history —
+    // to whoever holds this password. Refuse and say so.
+    if(existing && existing.role !== "admin"){
+      console.log(`⚠️ ADMIN_FLAT "${flatNumber}" already belongs to a ${existing.role || "member"} — admin seed skipped.`);
+      return;
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    if(existing){
+      existing.password = hashedPassword;
+      await existing.save();
+      console.log(`🔑 Admin password reset for flat ${existing.flatNumber}`);
+      return;
+    }
+
+    // No maintenance amount, so monthly billing skips this account.
+    await new Member({
+      name: "Society Admin",
+      flatNumber,
+      password: hashedPassword,
+      role: "admin",
+      payments: []
+    }).save();
+
+    console.log(`🔑 Admin account created for flat ${flatNumber}`);
+  }catch(err){
+    console.log("Admin seed error:", err.message);
+  }
 }
 
 function hashToken(token){
