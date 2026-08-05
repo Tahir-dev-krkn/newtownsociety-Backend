@@ -287,8 +287,10 @@ Please pay as soon as possible 🙏`
 mongoose.connect(process.env.MONGO_URI)
 .then(()=>{
   console.log("✅ DB Connected");
-  // Catch up any monthly bills the cron may have missed while asleep.
-  runMonthlyBillingCatchUp();
+  // Catch up any monthly bills the cron may have missed while asleep — but not
+  // immediately. A cold start is triggered by somebody waiting on a request
+  // (usually a login), and replaying bills walks every member. Serve them first.
+  setTimeout(runMonthlyBillingCatchUp, 60 * 1000);
 })
 .catch(err=>console.log(err));
 
@@ -361,6 +363,23 @@ function maskEmail(email){
 
 function escapeRegex(value){
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Flat numbers are typed by hand ("a-101" vs "A-101", "admin" vs "Admin") and
+// /add-member already blocks duplicates case-insensitively — so lookups must
+// match the same way, or a member gets locked out of their own account.
+async function findMemberByFlat(flatNumber){
+  const cleanFlatNumber = String(flatNumber || "").trim();
+
+  if(!cleanFlatNumber) return null;
+
+  const exactMatch = await Member.findOne({ flatNumber: cleanFlatNumber });
+
+  if(exactMatch) return exactMatch;   // indexed fast path
+
+  return Member.findOne({
+    flatNumber: { $regex: `^${escapeRegex(cleanFlatNumber)}$`, $options: "i" }
+  });
 }
 
 function hashToken(token){
@@ -505,11 +524,16 @@ If you did not try to login, please contact the society office.`
 
 // ================= LOGIN =================
 app.post("/login", loginLimiter, async(req,res)=>{
-  
-  const user=await Member.findOne({flatNumber:req.body.flatNumber});
-  if(!user) return res.json({success:false});
+ try{
+  const flatNumber = String(req.body.flatNumber || "").trim();
+  const password = String(req.body.password || "");
 
-  const match=await bcrypt.compare(req.body.password,user.password);
+  if(!flatNumber || !password) return res.json({success:false});
+
+  const user=await findMemberByFlat(flatNumber);
+  if(!user || !user.password) return res.json({success:false});
+
+  const match=await bcrypt.compare(password,user.password);
   if(!match) return res.json({success:false});
 
   if(user.role === "owner" && user.emailVerified !== true){
@@ -542,12 +566,21 @@ app.post("/login", loginLimiter, async(req,res)=>{
 
   const token=jwt.sign({flat:user.flatNumber,role:user.role},SECRET,{expiresIn:TOKEN_TTL});
   res.json({success:true,token,role:user.role});
+ }catch(err){
+  // A cold-starting free-tier instance can reject the very first DB query.
+  // Say that plainly instead of dying with an unreadable 500.
+  console.log("Login error:", err.message);
+  res.status(503).json({
+    success:false,
+    message:"Server is still waking up. Please try again in a few seconds."
+  });
+ }
 });
 
 app.post("/verify-email", otpLimiter, async(req,res)=>{
   const { flatNumber, otp } = req.body;
 
-  const user = await Member.findOne({ flatNumber });
+  const user = await findMemberByFlat(flatNumber);
 
   if(!user) return res.status(404).json({ success:false, message:"User not found" });
   if(user.role !== "owner") return res.status(400).json({ success:false, message:"Only owners need email verification" });
