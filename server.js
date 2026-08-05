@@ -805,6 +805,55 @@ app.put("/update-profile", auth, async (req, res) => {
   res.send("Profile updated");
 });
 
+// Read-only view of the logged-in account. Admins have no resident dashboard,
+// so this is how they see their own details.
+app.get("/me", auth, async (req, res) => {
+  const user = await Member.findOne({ flatNumber: req.user.flat })
+    .select("name flatNumber phone email role emailVerified");
+
+  if (!user) return res.status(404).send("Member not found");
+
+  res.json(user);
+});
+
+// Change your own password from inside the app. Until now the only way to
+// change one was the emailed reset link, which the admin account cannot always
+// use. Scoped to the logged-in user — no id is accepted from the body — and it
+// writes nothing but the password field.
+app.post("/change-password", auth, otpLimiter, async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || "");
+    const newPassword = String(req.body.newPassword || "");
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).send("Enter your current and new password");
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).send("New password must be at least 8 characters");
+    }
+
+    const user = await Member.findOne({ flatNumber: req.user.flat });
+
+    if (!user || !user.password) return res.status(404).send("Member not found");
+
+    const match = await bcrypt.compare(currentPassword, user.password);
+
+    if (!match) return res.status(400).send("Current password is wrong");
+
+    user.password = await bcrypt.hash(newPassword, 10);
+
+    await user.save();
+
+    console.log(`🔑 Password changed by ${user.flatNumber}`);
+
+    res.send("Password updated");
+  } catch (error) {
+    console.log("Change password error:", error.message);
+    res.status(500).send("Could not update password");
+  }
+});
+
 async function sendPasswordResetLink(req, res){
   try {
     const { email } = req.body;
