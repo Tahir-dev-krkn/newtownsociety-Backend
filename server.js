@@ -232,7 +232,7 @@ const TOKEN_TTL = process.env.JWT_EXPIRES_IN || "30d";
 cron.schedule("0 10 * * *", async () => {
   console.log("⏰ Running auto reminder...");
 
-  const members = await Member.find();
+  const members = await Member.find({ role: "owner" });
   const today = new Date().toDateString();
 
   for (let m of members) {
@@ -1069,7 +1069,7 @@ const newMember = new Member({
 });
 
 app.get("/all-payments", auth, adminOnly, async (req, res) => {
-  const members = await Member.find();
+  const members = await Member.find({ role: "owner" });
 
   let list = [];
 
@@ -1148,21 +1148,31 @@ app.post("/export-history", auth, adminOnly, async (req, res) => {
 app.get("/my-dashboard", auth, async(req,res)=>{
   const user = await Member.findOne({flatNumber:req.user.flat});
 
+  if(!user) return res.status(404).send("Member not found");
+
   const now = new Date();
   const month = now.toLocaleString("default",{month:"long"});
   const year = now.getFullYear();
 
   // 🔥 CHECK IF CURRENT MONTH BILL EXISTS
-  let exists = user.payments.find(p=>p.month===month && p.year===year);
+  // Only residents get billed, and only when a real maintenance amount is set.
+  // Without these guards this quietly turned a staff/admin login into a paying
+  // customer, and pushed an amount-less due onto anyone with no amount.
+  const monthlyAmount = Number(user.monthlyMaintenance);
+  const billable = user.role === "owner" && Number.isFinite(monthlyAmount) && monthlyAmount > 0;
 
-  if(!exists){
-    user.payments.push({
-      month,
-      year,
-      amount: user.monthlyMaintenance
-    });
+  if(billable){
+    let exists = user.payments.find(p=>p.month===month && p.year===year);
 
-    await user.save();
+    if(!exists){
+      user.payments.push({
+        month,
+        year,
+        amount: monthlyAmount
+      });
+
+      await user.save();
+    }
   }
 
   let current=[],due=[],paid=[];
@@ -1360,7 +1370,7 @@ app.delete("/due/:paymentId", auth, adminOnly, async(req,res)=>{
 
 // ================= PENDING =================
 app.get("/pending", auth, adminOnly, async(req,res)=>{
-  const members=await Member.find();
+  const members=await Member.find({ role: "owner" });
 
   let list=[];
 
@@ -1400,7 +1410,7 @@ app.get("/export", auth, adminOnly, async (req, res) => {
   role: "owner"   // 👈 FILTER ONLY OWNERS
 });
   } else {
-    members = await Member.find();
+    members = await Member.find({ role: "owner" });   // 👈 FILTER ONLY OWNERS
   }
 
   console.log("MEMBERS COUNT:", members.length);
@@ -1475,7 +1485,14 @@ async function ensureMonthlyBillsForAll({ notify = false } = {}) {
     try {
       const amount = Number(m.monthlyMaintenance);
 
-      // Skip anyone without a real maintenance amount (e.g. admin/staff)
+      // Only residents owe maintenance. Staff/admin logins are not customers,
+      // even if an amount was left on their record.
+      if (m.role !== "owner") {
+        report.skipped.push({ flat: m.flatNumber, reason: "not a resident" });
+        continue;
+      }
+
+      // Skip anyone without a real maintenance amount
       if (!Number.isFinite(amount) || amount <= 0) {
         report.skipped.push({ flat: m.flatNumber, reason: "no maintenance amount" });
         continue;
