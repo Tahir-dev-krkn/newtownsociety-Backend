@@ -434,6 +434,24 @@ async function seedAdminFromEnv(){
   }
 }
 
+// Same story as findMemberByFlat: emails written before normalization existed
+// (or typed straight into Atlas) can carry capitals, and an exact lowercase
+// match then tells an owner "no account found" for their own address.
+async function findMemberByEmail(email, extraQuery = {}){
+  const cleanEmail = normalizeEmail(email);
+
+  if(!cleanEmail) return null;
+
+  const exactMatch = await Member.findOne({ email: cleanEmail, ...extraQuery });
+
+  if(exactMatch) return exactMatch;   // indexed fast path
+
+  return Member.findOne({
+    email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: "i" },
+    ...extraQuery
+  });
+}
+
 function hashToken(token){
   return crypto.createHash("sha256").update(token).digest("hex");
 }
@@ -457,6 +475,39 @@ async function createMailTransporter(){
       pass: process.env.EMAIL_PASS
     }
   });
+}
+
+function getMailFrom(){
+  return process.env.MAIL_FROM || process.env.EMAIL_USER;
+}
+
+// Render blocks outbound SMTP, which is the whole reason mail was being bounced
+// through a relay on Vercel. Resend delivers over ordinary HTTPS, so the
+// backend can send directly and the relay hop disappears.
+function shouldUseResend(){
+  return Boolean(process.env.RESEND_API_KEY && getMailFrom());
+}
+
+async function sendViaResend(mailOptions){
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: getMailFrom(),
+      to: [mailOptions.to],
+      subject: mailOptions.subject,
+      text: mailOptions.text
+    }),
+    signal: AbortSignal.timeout(15000)
+  });
+
+  if(!response.ok){
+    const message = await response.text();
+    throw new Error(`Resend rejected the email (${response.status}): ${message}`);
+  }
 }
 
 function shouldUseMailRelay(){
@@ -516,27 +567,45 @@ async function verifyMailRelay(){
   }
 }
 
+// Resend first when it is configured, then the relay, then direct SMTP for
+// local development. One place decides, so both send paths agree.
+function getMailTransport(){
+  if(shouldUseResend()) return "resend";
+  if(shouldUseMailRelay()) return "relay";
+  return "smtp";
+}
+
+async function deliverMail(mailOptions){
+  const transport = getMailTransport();
+
+  if(transport === "resend") return sendViaResend(mailOptions);
+  if(transport === "relay") return relayMail(mailOptions);
+
+  const transporter = await createMailTransporter();
+  await transporter.sendMail(mailOptions);
+}
+
 function sendMailInBackground(mailOptions, context){
-  (shouldUseMailRelay()
-    ? relayMail(mailOptions)
-    : createMailTransporter().then(transporter => transporter.sendMail(mailOptions)))
-    .then(() => console.log(`${context} email sent`))
+  deliverMail(mailOptions)
+    .then(() => console.log(`${context} email sent via ${getMailTransport()}`))
     .catch(error => console.log(`${context} email failed:`, error.message));
 }
 
 async function sendMailNow(mailOptions, context){
-  try {
-    if(shouldUseMailRelay()){
-      await relayMail(mailOptions);
-    }else{
-      const transporter = await createMailTransporter();
-      await transporter.sendMail(mailOptions);
-    }
+  const transport = getMailTransport();
 
-    console.log(`${context} email sent`);
+  try {
+    await deliverMail(mailOptions);
+
+    console.log(`${context} email sent via ${transport}`);
   } catch (error) {
     console.log(`${context} email failed:`, error.message);
-    throw new Error("Email could not be sent. Check EMAIL_USER and EMAIL_PASS in Render.");
+
+    throw new Error(
+      transport === "resend"
+        ? "Email could not be sent. Check RESEND_API_KEY and MAIL_FROM in Render."
+        : "Email could not be sent. Check EMAIL_USER and EMAIL_PASS in Render."
+    );
   }
 }
 
@@ -861,9 +930,7 @@ async function sendPasswordResetLink(req, res){
 
     if (!cleanEmail) return res.status(400).send("Enter email");
 
-    const user = await Member.findOne({
-      email: cleanEmail
-    });
+    const user = await findMemberByEmail(cleanEmail);
 
     if (!user) return res.status(404).send("No account found with this email");
 
@@ -916,8 +983,7 @@ app.post("/reset-password", otpLimiter, async (req, res) => {
       return res.status(400).send("Password must be at least 4 characters");
     }
 
-    const user = await Member.findOne({
-      email: cleanEmail,
+    const user = await findMemberByEmail(cleanEmail, {
       passwordResetTokenHash: hashToken(token)
     });
 
@@ -951,9 +1017,7 @@ app.post("/verify-otp", otpLimiter, async (req, res) => {
       return res.status(400).send("Enter email, OTP, and new password");
     }
 
-    const user = await Member.findOne({
-      email: cleanEmail
-    });
+    const user = await findMemberByEmail(cleanEmail);
 
     if (!user) return res.status(404).send("No account found with this email");
 
@@ -2612,15 +2676,29 @@ app.get("/health", (req, res) => {
     build: "vercel-mail-relay-jwt-secret",
     emailUser: maskEmail(process.env.EMAIL_USER),
     emailPassConfigured: Boolean(process.env.EMAIL_PASS),
-    mailRelay: shouldUseMailRelay() ? getMailRelayUrl() : null,
+    mailTransport: getMailTransport(),
+    mailFrom: getMailTransport() === "resend" ? getMailFrom() : null,
+    mailRelay: getMailTransport() === "relay" ? getMailRelayUrl() : null,
     razorpayConfigured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
     razorpayMode: getRazorpayMode()
   });
 });
 
 app.get("/health-email", async (req, res) => {
+  const via = getMailTransport();
+
   try {
-    if(shouldUseMailRelay()){
+    if(via === "resend"){
+      // Cheapest way to prove the key works without sending anything.
+      const response = await fetch("https://api.resend.com/domains", {
+        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if(!response.ok){
+        throw new Error(`Resend key rejected (${response.status})`);
+      }
+    }else if(via === "relay"){
       await verifyMailRelay();
     }else{
       const transporter = await createMailTransporter();
@@ -2629,14 +2707,14 @@ app.get("/health-email", async (req, res) => {
 
     res.json({
       ok: true,
-      emailUser: maskEmail(process.env.EMAIL_USER),
-      via: shouldUseMailRelay() ? "relay" : "smtp"
+      via,
+      from: via === "resend" ? getMailFrom() : maskEmail(process.env.EMAIL_USER)
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
-      emailUser: maskEmail(process.env.EMAIL_USER),
-      via: shouldUseMailRelay() ? "relay" : "smtp",
+      via,
+      from: via === "resend" ? getMailFrom() : maskEmail(process.env.EMAIL_USER),
       code: error.code,
       responseCode: error.responseCode,
       command: error.command,
