@@ -575,19 +575,43 @@ function getMailTransport(){
   return "smtp";
 }
 
+// Try every configured transport in order rather than giving up on the first
+// failure — a resident who never receives their OTP is locked out of the app
+// entirely, so one flaky provider must not decide that.
 async function deliverMail(mailOptions){
-  const transport = getMailTransport();
+  const transports = [];
 
-  if(transport === "resend") return sendViaResend(mailOptions);
-  if(transport === "relay") return relayMail(mailOptions);
+  if(shouldUseResend()){
+    transports.push(["resend", () => sendViaResend(mailOptions)]);
+  }
 
-  const transporter = await createMailTransporter();
-  await transporter.sendMail(mailOptions);
+  if(shouldUseMailRelay()){
+    transports.push(["relay", () => relayMail(mailOptions)]);
+  }
+
+  transports.push(["smtp", async () => {
+    const transporter = await createMailTransporter();
+    await transporter.sendMail(mailOptions);
+  }]);
+
+  let lastError;
+
+  for(const [name, send] of transports){
+    try{
+      await send();
+      return name;
+    }catch(error){
+      lastError = error;
+      console.log(`Mail via ${name} failed:`, error.message);
+    }
+  }
+
+  throw lastError || new Error("No mail transport is configured");
 }
 
 function sendMailInBackground(mailOptions, context){
   deliverMail(mailOptions)
-    .then(() => console.log(`${context} email sent via ${getMailTransport()}`))
+    .then(via => console.log(`${context} email sent via ${via}`))
     .catch(error => console.log(`${context} email failed:`, error.message));
 }
 
@@ -595,9 +619,9 @@ async function sendMailNow(mailOptions, context){
   const transport = getMailTransport();
 
   try {
-    await deliverMail(mailOptions);
+    const via = await deliverMail(mailOptions);
 
-    console.log(`${context} email sent via ${transport}`);
+    console.log(`${context} email sent via ${via}`);
   } catch (error) {
     console.log(`${context} email failed:`, error.message);
 
@@ -685,8 +709,15 @@ app.post("/login", loginLimiter, async(req,res)=>{
     });
   }
 
+  // New residents are handed flat number as both username and password, so a
+  // password still equal to the flat number means they have never set one.
+  // No extra field to keep in sync: it stops being true the moment they do.
+  const usingDefaultPassword = user.role === "owner"
+    ? await bcrypt.compare(user.flatNumber, user.password)
+    : false;
+
   const token=jwt.sign({flat:user.flatNumber,role:user.role},SECRET,{expiresIn:TOKEN_TTL});
-  res.json({success:true,token,role:user.role});
+  res.json({success:true,token,role:user.role,mustChangePassword:usingDefaultPassword});
  }catch(err){
   // A cold-starting free-tier instance can reject the very first DB query.
   // Say that plainly instead of dying with an unreadable 500.
