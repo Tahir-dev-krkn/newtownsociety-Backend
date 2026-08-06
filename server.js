@@ -484,15 +484,21 @@ function getMailFrom(){
 // Render blocks outbound SMTP, which is the whole reason mail was being bounced
 // through a relay on Vercel. Resend delivers over ordinary HTTPS, so the
 // backend can send directly and the relay hop disappears.
+// Pasting a key into a dashboard picks up trailing spaces and newlines far too
+// easily, and the only symptom is a bare 401.
+function getResendApiKey(){
+  return String(process.env.RESEND_API_KEY || "").trim();
+}
+
 function shouldUseResend(){
-  return Boolean(process.env.RESEND_API_KEY && getMailFrom());
+  return Boolean(getResendApiKey() && getMailFrom());
 }
 
 async function sendViaResend(mailOptions){
   const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      Authorization: `Bearer ${getResendApiKey()}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
@@ -2722,12 +2728,26 @@ app.get("/health-email", async (req, res) => {
     if(via === "resend"){
       // Cheapest way to prove the key works without sending anything.
       const response = await fetch("https://api.resend.com/domains", {
-        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        headers: { Authorization: `Bearer ${getResendApiKey()}` },
         signal: AbortSignal.timeout(15000)
       });
 
       if(!response.ok){
-        throw new Error(`Resend key rejected (${response.status})`);
+        const details = await response.text();
+
+        // A sending-only key is not allowed to list domains. That is the key
+        // working exactly as scoped, not a broken key — and sending-only is
+        // the scope this server should be using.
+        if(!details.includes("restricted_api_key")){
+          throw new Error(`Resend key rejected (${response.status}): ${details}`);
+        }
+
+        return res.json({
+          ok: true,
+          via,
+          keyScope: "sending-only",
+          from: getMailFrom()
+        });
       }
     }else if(via === "relay"){
       await verifyMailRelay();
