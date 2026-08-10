@@ -1613,8 +1613,11 @@ app.get("/export", auth, adminOnly, async (req, res) => {
 });
 
 // ================= PENDING REPORT (PDF) =================
-// Read-only: builds one PDF listing every member's pending dues and totals.
+// Read-only: builds a PDF with ONE PAGE PER MEMBER (each individual's pending
+// dues on its own page, with the society logo), plus a final summary page.
 // Touches no data — only reads Member records.
+const PENDING_PDF_LOGO_PATH = `${__dirname}/assets/logo.png`;
+
 app.get("/export-pending-pdf", auth, adminOnly, async (req, res) => {
   try {
     const members = await Member.find({ role: "owner" });
@@ -1637,55 +1640,98 @@ app.get("/export-pending-pdf", auth, adminOnly, async (req, res) => {
 
     doc.pipe(res);
 
-    doc.fontSize(18).fillColor("#0a4d2c").text("New Town Society", { align: "center" });
-    doc.fontSize(13).fillColor("#000").text("Pending Maintenance Report", { align: "center" });
-    doc.fontSize(9).fillColor("#666")
-      .text(`Generated: ${new Date().toLocaleString()}`, { align: "center" });
-    doc.fillColor("#000").moveDown(1);
+    const hasLogo = fs.existsSync(PENDING_PDF_LOGO_PATH);
+    const generatedAt = new Date().toLocaleString();
+
+    // Draws the logo + title band at the top of the CURRENT page.
+    function drawPageHeader() {
+      const top = doc.page.margins.top;
+      const logoW = 64;
+
+      if (hasLogo) {
+        try {
+          doc.image(
+            PENDING_PDF_LOGO_PATH,
+            (doc.page.width - logoW) / 2,
+            top,
+            { width: logoW }
+          );
+        } catch (imgErr) {
+          console.log("Pending PDF logo skipped:", imgErr.message);
+        }
+        doc.y = top + logoW + 8;
+      } else {
+        doc.y = top;
+      }
+
+      doc.fontSize(16).fillColor("#0a4d2c").text("New Town Society", { align: "center" });
+      doc.fontSize(12).fillColor("#000").text("Pending Maintenance Report", { align: "center" });
+      doc.fontSize(8).fillColor("#666").text(`Generated: ${generatedAt}`, { align: "center" });
+      doc.moveDown(1.2);
+      doc.fillColor("#000");
+    }
 
     let grandTotal = 0;
     let membersWithDue = 0;
+    let firstPage = true;
 
+    // ONE PAGE PER MEMBER
     for (const m of sorted) {
+      if (!firstPage) doc.addPage();
+      firstPage = false;
+
+      drawPageHeader();
+
       const pending = (m.payments || []).filter(
         p => p.status !== "paid" && Number(p.amount) > 0
       );
-
-      if (pending.length === 0) continue;
-
-      membersWithDue++;
       const memberTotal = pending.reduce((sum, p) => sum + Number(p.amount || 0), 0);
-      grandTotal += memberTotal;
 
-      doc.fontSize(12).fillColor("#0a4d2c")
+      doc.fontSize(14).fillColor("#0a4d2c")
         .text(`${m.name || "-"}   (Flat ${m.flatNumber || "-"})`);
-
       if (m.phone) {
-        doc.fontSize(9).fillColor("#555").text(`Phone: ${m.phone}`);
+        doc.fontSize(10).fillColor("#555").text(`Phone: ${m.phone}`);
       }
+      doc.moveDown(0.6);
 
-      pending.forEach(p => {
-        const label = p.description
-          || `${p.month || ""} ${p.year || ""}`.trim()
-          || "Maintenance";
-        doc.fontSize(10).fillColor("#000")
-          .text(`   • ${label}  —  Rs ${Number(p.amount || 0)}`);
-      });
+      if (pending.length === 0) {
+        doc.fontSize(12).fillColor("#0a7d2c").text("No pending dues — all clear.");
+      } else {
+        membersWithDue++;
+        grandTotal += memberTotal;
 
-      doc.moveDown(0.2);
-      doc.fontSize(11).fillColor("#b00020")
-        .text(`   Total pending: Rs ${memberTotal}`);
-      doc.fillColor("#000").moveDown(0.7);
+        doc.fontSize(11).fillColor("#000").text("Pending dues:");
+        doc.moveDown(0.3);
+
+        pending.forEach(p => {
+          const label = p.description
+            || `${p.month || ""} ${p.year || ""}`.trim()
+            || "Maintenance";
+          doc.fontSize(11).fillColor("#000")
+            .text(`   • ${label}  —  Rs ${Number(p.amount || 0)}`);
+        });
+
+        doc.moveDown(0.6);
+        doc.fontSize(13).fillColor("#b00020")
+          .text(`Total pending: Rs ${memberTotal}`);
+      }
     }
 
-    if (membersWithDue === 0) {
-      doc.fontSize(12).text("No pending dues. All members are clear.", { align: "center" });
-    } else {
-      doc.moveDown(0.4);
+    // FINAL SUMMARY PAGE
+    if (sorted.length > 0) {
+      doc.addPage();
+      drawPageHeader();
+      doc.fontSize(14).fillColor("#0a4d2c").text("Summary");
+      doc.moveDown(0.6);
       doc.fontSize(12).fillColor("#000")
-        .text(`Members with pending dues: ${membersWithDue}`);
-      doc.fontSize(13).fillColor("#0a4d2c")
+        .text(`Total members: ${sorted.length}`);
+      doc.text(`Members with pending dues: ${membersWithDue}`);
+      doc.moveDown(0.3);
+      doc.fontSize(14).fillColor("#0a4d2c")
         .text(`Grand total pending: Rs ${grandTotal}`);
+    } else {
+      drawPageHeader();
+      doc.fontSize(12).text("No members found.", { align: "center" });
     }
 
     doc.end();
