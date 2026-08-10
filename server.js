@@ -1612,6 +1612,93 @@ app.get("/export", auth, adminOnly, async (req, res) => {
   res.end();
 });
 
+// ================= PENDING REPORT (PDF) =================
+// Read-only: builds one PDF listing every member's pending dues and totals.
+// Touches no data — only reads Member records.
+app.get("/export-pending-pdf", auth, adminOnly, async (req, res) => {
+  try {
+    const members = await Member.find({ role: "owner" });
+
+    const sorted = members.slice().sort((a, b) =>
+      String(a.flatNumber || "").localeCompare(
+        String(b.flatNumber || ""),
+        undefined,
+        { numeric: true, sensitivity: "base" }
+      )
+    );
+
+    const doc = new PDFDocument({ margin: 40, size: "A4" });
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=pending-report.pdf"
+    );
+
+    doc.pipe(res);
+
+    doc.fontSize(18).fillColor("#0a4d2c").text("New Town Society", { align: "center" });
+    doc.fontSize(13).fillColor("#000").text("Pending Maintenance Report", { align: "center" });
+    doc.fontSize(9).fillColor("#666")
+      .text(`Generated: ${new Date().toLocaleString()}`, { align: "center" });
+    doc.fillColor("#000").moveDown(1);
+
+    let grandTotal = 0;
+    let membersWithDue = 0;
+
+    for (const m of sorted) {
+      const pending = (m.payments || []).filter(
+        p => p.status !== "paid" && Number(p.amount) > 0
+      );
+
+      if (pending.length === 0) continue;
+
+      membersWithDue++;
+      const memberTotal = pending.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+      grandTotal += memberTotal;
+
+      doc.fontSize(12).fillColor("#0a4d2c")
+        .text(`${m.name || "-"}   (Flat ${m.flatNumber || "-"})`);
+
+      if (m.phone) {
+        doc.fontSize(9).fillColor("#555").text(`Phone: ${m.phone}`);
+      }
+
+      pending.forEach(p => {
+        const label = p.description
+          || `${p.month || ""} ${p.year || ""}`.trim()
+          || "Maintenance";
+        doc.fontSize(10).fillColor("#000")
+          .text(`   • ${label}  —  Rs ${Number(p.amount || 0)}`);
+      });
+
+      doc.moveDown(0.2);
+      doc.fontSize(11).fillColor("#b00020")
+        .text(`   Total pending: Rs ${memberTotal}`);
+      doc.fillColor("#000").moveDown(0.7);
+    }
+
+    if (membersWithDue === 0) {
+      doc.fontSize(12).text("No pending dues. All members are clear.", { align: "center" });
+    } else {
+      doc.moveDown(0.4);
+      doc.fontSize(12).fillColor("#000")
+        .text(`Members with pending dues: ${membersWithDue}`);
+      doc.fontSize(13).fillColor("#0a4d2c")
+        .text(`Grand total pending: Rs ${grandTotal}`);
+    }
+
+    doc.end();
+  } catch (error) {
+    console.log("Pending PDF export error:", error.message);
+    if (!res.headersSent) {
+      res.status(500).send("Could not generate pending report");
+    } else {
+      res.end();
+    }
+  }
+});
+
 // 🔥 AUTO MONTHLY BILL
 // Idempotent: adds the current month's maintenance to every member who does
 // not already have it. Safe to run any number of times — a member is never
